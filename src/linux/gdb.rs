@@ -1,5 +1,4 @@
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
-use error::{self, Error::OsError};
 use kvm_bindings::*;
 use kvm_ioctls::{VcpuExit, VcpuFd};
 use libc::ioctl;
@@ -8,16 +7,16 @@ use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::os::unix::io::AsRawFd;
-use std::slice;
+use std::{io, slice};
 
-use arch::x86;
-use gdb_parser::{
-	Breakpoint, Error, FileData, Handler, Id, MemoryRegion, ProcessInfo, ProcessType, StopReason,
-	ThreadId, VCont, VContFeature, Watchpoint,
+use crate::arch::x86;
+use crate::gdb_parser::{
+	get_max_subslice, Breakpoint, Error, FileData, Handler, Id, MemoryRegion, ProcessInfo,
+	ProcessType, StopReason, ThreadId, VCont, VContFeature, Watchpoint,
 };
-use linux::vcpu::UhyveCPU;
-use utils::get_max_subslice;
-use vm::VirtualCPU;
+use crate::linux::vcpu::UhyveCPU;
+use crate::vm::VirtualCPU;
+use log::{debug, error, info};
 
 /// Debugging Stub for linux/x64
 /// Currently supported features:
@@ -36,7 +35,7 @@ const INT3: &[u8] = &[0xcc];
 impl UhyveCPU {
 	/// Called on Trap. Creates Handler.
 	/// Enter gdb-event-loop until gdb tells us to continue. Set singlestep mode if necessary and return
-	pub fn gdb_handle_exception<'a>(&mut self, signal: Option<VcpuExit<'a>>) {
+	pub fn gdb_handle_exception(&mut self, signal: Option<VcpuExit<'_>>) {
 		debug!("Handling debug exception!");
 		if let Some(dbg) = &mut self.dbg {
 			let dbgarc = dbg.clone();
@@ -49,7 +48,7 @@ impl UhyveCPU {
 					Some(StopReason::Signal(5)),
 				)
 			} else {
-				// target stopped on boot. No signal recv'd yet. Pretend debug singal..? Not used rn anyways
+				// target stopped on boot. No signal recv'd yet. Pretend debug signal? Not used rn anyways.
 				(CmdHandler::new(self, &dbg.state, VcpuExit::Debug), None)
 			};
 
@@ -69,13 +68,11 @@ impl UhyveCPU {
 			match vcont {
 				VCont::Continue | VCont::ContinueWithSignal(_) => {
 					info!("Continuing execution..");
-					self.kvm_change_guestdbg(false, hwbr.as_ref())
-						.expect("Could not change KVM debugging state"); // TODO: optimize this, dont call too often?
+					self.kvm_change_guestdbg(false, hwbr.as_ref()); // TODO: optimize this, don't call too often?
 				}
 				VCont::Step | VCont::StepWithSignal(_) => {
 					info!("Starting Single Stepping..");
-					self.kvm_change_guestdbg(true, hwbr.as_ref())
-						.expect("Could not change KVM debugging state"); // TODO: optimize this, dont call too often?
+					self.kvm_change_guestdbg(true, hwbr.as_ref()); // TODO: optimize this, don't call too often?
 				}
 				_ => error!("Unknown Handler exit reason!"),
 			}
@@ -84,14 +81,14 @@ impl UhyveCPU {
 		};
 	}
 
-	pub unsafe fn read_mem(&self, guest_addr: usize, len: usize) -> &[u8] {
+	unsafe fn read_mem(&self, guest_addr: usize, len: usize) -> &[u8] {
 		let phys = self.virt_to_phys(guest_addr);
 		let host = self.host_address(phys);
 
 		slice::from_raw_parts(host as *mut u8, len)
 	}
 
-	pub unsafe fn write_mem(&self, guest_addr: usize, data: &[u8]) {
+	unsafe fn write_mem(&self, guest_addr: usize, data: &[u8]) {
 		let phys = self.virt_to_phys(guest_addr);
 		let host = self.host_address(phys);
 
@@ -100,11 +97,11 @@ impl UhyveCPU {
 		mem.copy_from_slice(data);
 	}
 
-	pub fn kvm_change_guestdbg(
+	fn kvm_change_guestdbg(
 		&mut self,
 		single_step: bool,
 		hwbr: Option<&x86::HWBreakpoints>, /*&HashMap<usize, Breakpoint>*/
-	) -> Result<(), error::Error> {
+	) {
 		debug!("KVM: Enable guest debug. SS:{}", single_step);
 		let mut dbg = kvm_guest_debug {
 			control: KVM_GUESTDBG_ENABLE | KVM_GUESTDBG_USE_SW_BP, // KVM_GUESTDBG_USE_HW_BP
@@ -134,10 +131,11 @@ impl UhyveCPU {
 			)
 		};
 		if ret < 0 {
-			return Err(OsError(unsafe { *libc::__errno_location() }));
+			panic!(
+				"Could not change KVM debugging state: {:?}",
+				io::Error::last_os_error()
+			)
 		}
-
-		Ok(())
 	}
 }
 
@@ -167,7 +165,7 @@ struct HWBreakpoint {
 }
 
 impl State {
-	pub fn new() -> Self {
+	pub(crate) fn new() -> Self {
 		Self {
 			breakpoints: HashMap::new(),
 			breakpoints_hw: HashMap::new(),
@@ -471,7 +469,9 @@ impl<'a> Handler for CmdHandler<'a> {
 	/// At most apply one action per thread. GDB likes to send default action for other threads,
 	/// even if it knows only about 1: "vCont;s:1;c" (step thread 1, continue others)
 	fn vcont(&self, actions: Vec<(VCont, Option<ThreadId>)>) -> Result<StopReason, Error> {
-		for (cmd, id) in &actions {
+		if !actions.is_empty() {
+			let (cmd, id) = &actions[0];
+
 			let _id = id.unwrap_or(ThreadId {
 				pid: Id::All,
 				tid: Id::All,
@@ -486,11 +486,9 @@ impl<'a> Handler for CmdHandler<'a> {
 			debug!("vcont: {:?}", *cmd);
 			// need to clone, since std::ops::Range<T: Copy> should probably also be Copy, but it isn't.
 			self.continue_execution(cmd.clone());
-
-			break;
 		}
 
-		// this reason should not matter, since we dont send it when continuing.
+		// This reason should not matter, since we don't send it when continuing.
 		Ok(StopReason::Signal(0))
 	}
 
@@ -612,34 +610,8 @@ pub struct Registers {
 impl Registers {
 	/// Loads the register set from kvm into the register struct
 	pub fn from_kvm(cpu: &VcpuFd) -> Self {
-		let regs = cpu.get_regs().expect("Cant get regs from kvm!");
-		let sregs = cpu.get_sregs().expect("Cant get sregs from kvm!");
-
-		let mut registers = Registers::default();
-		registers.r15 = Some(regs.r15);
-		registers.r14 = Some(regs.r14);
-		registers.r13 = Some(regs.r13);
-		registers.r12 = Some(regs.r12);
-		registers.r11 = Some(regs.r11);
-		registers.r10 = Some(regs.r10);
-		registers.r9 = Some(regs.r9);
-		registers.r8 = Some(regs.r8);
-		registers.rax = Some(regs.rax);
-		registers.rbx = Some(regs.rbx);
-		registers.rcx = Some(regs.rcx);
-		registers.rdx = Some(regs.rdx);
-		registers.rsi = Some(regs.rsi);
-		registers.rdi = Some(regs.rdi);
-		registers.rsp = Some(regs.rsp);
-		registers.rbp = Some(regs.rbp);
-		registers.rip = Some(regs.rip);
-		registers.eflags = Some(regs.rflags as _);
-		registers.cs = Some(sregs.cs.base as _);
-		registers.ss = Some(sregs.ss.base as _);
-		registers.ds = Some(sregs.ds.base as _);
-		registers.es = Some(sregs.es.base as _);
-		registers.fs = Some(sregs.fs.base as _);
-		registers.gs = Some(sregs.gs.base as _);
+		let regs = cpu.get_regs().expect("Can't get regs from kvm!");
+		let sregs = cpu.get_sregs().expect("Can't get sregs from kvm!");
 
 		/*registers.fctrl = Some(float.cwd as _);
 		registers.fop = Some(float.fop as _);
@@ -674,13 +646,38 @@ impl Registers {
 		registers.fs_base = Some(sregs.fs.base as _);
 		registers.gs_base = Some(sregs.gs.base as _);*/
 
-		registers
+		Self {
+			r15: Some(regs.r15),
+			r14: Some(regs.r14),
+			r13: Some(regs.r13),
+			r12: Some(regs.r12),
+			r11: Some(regs.r11),
+			r10: Some(regs.r10),
+			r9: Some(regs.r9),
+			r8: Some(regs.r8),
+			rax: Some(regs.rax),
+			rbx: Some(regs.rbx),
+			rcx: Some(regs.rcx),
+			rdx: Some(regs.rdx),
+			rsi: Some(regs.rsi),
+			rdi: Some(regs.rdi),
+			rsp: Some(regs.rsp),
+			rbp: Some(regs.rbp),
+			rip: Some(regs.rip),
+			eflags: Some(regs.rflags as _),
+			cs: Some(sregs.cs.base as _),
+			ss: Some(sregs.ss.base as _),
+			ds: Some(sregs.ds.base as _),
+			es: Some(sregs.es.base as _),
+			fs: Some(sregs.fs.base as _),
+			gs: Some(sregs.gs.base as _),
+		}
 	}
 
 	/// Saves a register struct (only where non-None values are) into kvm.
 	pub fn to_kvm(&self, cpu: &mut VcpuFd) {
-		let mut regs = cpu.get_regs().expect("Cant get regs from kvm!");
-		let mut sregs = cpu.get_sregs().expect("Cant get sregs from kvm!");
+		let mut regs = cpu.get_regs().expect("Can't get regs from kvm!");
+		let mut sregs = cpu.get_sregs().expect("Can't get sregs from kvm!");
 
 		regs.r15 = self.r15.unwrap_or(regs.r15);
 		regs.r14 = self.r14.unwrap_or(regs.r14);
@@ -707,43 +704,39 @@ impl Registers {
 		sregs.fs.base = self.fs.unwrap_or(sregs.fs.base as _) as _;
 		sregs.gs.base = self.gs.unwrap_or(sregs.gs.base as _) as _;
 
-		cpu.set_regs(&regs).expect("Cant set regs to kvm!");
-		cpu.set_sregs(&sregs).expect("Cant set regs to kvm!");
+		cpu.set_regs(&regs).expect("Can't set regs to kvm!");
+		cpu.set_sregs(&sregs).expect("Can't set regs to kvm!");
 	}
 
 	/// take the serialized register set send by gdb and decodes it into a register structure.
 	/// uses little endian, order as specified by gdb arch i386:x86-64
-	pub fn decode(raw: &[u8]) -> Self {
-		let mut registers = Registers::default();
-		let mut raw = raw.clone();
-
-		registers.rax = raw.read_u64::<LittleEndian>().ok();
-		registers.rbx = raw.read_u64::<LittleEndian>().ok();
-		registers.rcx = raw.read_u64::<LittleEndian>().ok();
-		registers.rdx = raw.read_u64::<LittleEndian>().ok();
-		registers.rsi = raw.read_u64::<LittleEndian>().ok();
-		registers.rdi = raw.read_u64::<LittleEndian>().ok();
-		registers.rbp = raw.read_u64::<LittleEndian>().ok();
-		registers.rsp = raw.read_u64::<LittleEndian>().ok();
-		registers.r8 = raw.read_u64::<LittleEndian>().ok();
-		registers.r9 = raw.read_u64::<LittleEndian>().ok();
-		registers.r10 = raw.read_u64::<LittleEndian>().ok();
-		registers.r11 = raw.read_u64::<LittleEndian>().ok();
-		registers.r12 = raw.read_u64::<LittleEndian>().ok();
-		registers.r13 = raw.read_u64::<LittleEndian>().ok();
-		registers.r14 = raw.read_u64::<LittleEndian>().ok();
-		registers.r15 = raw.read_u64::<LittleEndian>().ok();
-		registers.rip = raw.read_u64::<LittleEndian>().ok();
-
-		registers.eflags = raw.read_u32::<LittleEndian>().ok();
-		registers.cs = raw.read_u32::<LittleEndian>().ok();
-		registers.ss = raw.read_u32::<LittleEndian>().ok();
-		registers.ds = raw.read_u32::<LittleEndian>().ok();
-		registers.es = raw.read_u32::<LittleEndian>().ok();
-		registers.fs = raw.read_u32::<LittleEndian>().ok();
-		registers.gs = raw.read_u32::<LittleEndian>().ok();
-
-		registers
+	pub fn decode(mut raw: &[u8]) -> Self {
+		Self {
+			rax: raw.read_u64::<LittleEndian>().ok(),
+			rbx: raw.read_u64::<LittleEndian>().ok(),
+			rcx: raw.read_u64::<LittleEndian>().ok(),
+			rdx: raw.read_u64::<LittleEndian>().ok(),
+			rsi: raw.read_u64::<LittleEndian>().ok(),
+			rdi: raw.read_u64::<LittleEndian>().ok(),
+			rbp: raw.read_u64::<LittleEndian>().ok(),
+			rsp: raw.read_u64::<LittleEndian>().ok(),
+			r8: raw.read_u64::<LittleEndian>().ok(),
+			r9: raw.read_u64::<LittleEndian>().ok(),
+			r10: raw.read_u64::<LittleEndian>().ok(),
+			r11: raw.read_u64::<LittleEndian>().ok(),
+			r12: raw.read_u64::<LittleEndian>().ok(),
+			r13: raw.read_u64::<LittleEndian>().ok(),
+			r14: raw.read_u64::<LittleEndian>().ok(),
+			r15: raw.read_u64::<LittleEndian>().ok(),
+			rip: raw.read_u64::<LittleEndian>().ok(),
+			eflags: raw.read_u32::<LittleEndian>().ok(),
+			cs: raw.read_u32::<LittleEndian>().ok(),
+			ss: raw.read_u32::<LittleEndian>().ok(),
+			ds: raw.read_u32::<LittleEndian>().ok(),
+			es: raw.read_u32::<LittleEndian>().ok(),
+			fs: raw.read_u32::<LittleEndian>().ok(),
+			gs: raw.read_u32::<LittleEndian>().ok(),
+		}
 	}
 
 	/// take the register set and encode it as a u8-vector by concatenating the values

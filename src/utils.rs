@@ -1,39 +1,90 @@
-use error::*;
-use std::env;
+//! Utilities for the binary frontend.
+//!
+//! These functions are used to parse command line arguments or determining defaults.
 
-pub fn parse_mem(mem: &str) -> Result<usize> {
-	let (num, postfix): (String, String) = mem.chars().partition(|&x| x.is_numeric());
-	let num = num.parse::<usize>().map_err(|_| Error::ParseMemory)?;
+use std::{io, iter, num::ParseIntError};
 
-	let factor = match postfix.as_str() {
-		"E" | "e" => 1 << 60 as usize,
-		"P" | "p" => 1 << 50 as usize,
-		"T" | "t" => 1 << 40 as usize,
-		"G" | "g" => 1 << 30 as usize,
-		"M" | "m" => 1 << 20 as usize,
-		"K" | "k" => 1 << 10 as usize,
-		_ => return Err(Error::ParseMemory),
-	};
+use either::Either;
 
-	Ok(num * factor)
-}
+/// Checks if the kernel provides support for transparent huge pages
+pub fn transparent_hugepages_available() -> io::Result<bool> {
+	if cfg!(target_os = "linux") {
+		use std::fs;
+		use std::path::Path;
 
-pub fn parse_u32(s: &str) -> Result<u32> {
-	s.parse::<u32>().map_err(|_| Error::ParseMemory)
-}
-
-pub fn parse_bool(name: &str, default: bool) -> bool {
-	env::var(name)
-		.map(|x| x.parse::<i32>().unwrap_or(default as i32) != 0)
-		.unwrap_or(default)
-}
-
-/// returns subslice of s at given offset of at most given length. If offset OOB, return empty slice
-pub fn get_max_subslice(s: &str, offset: usize, length: usize) -> &str {
-	let large = s.get(offset..s.len()).unwrap_or("");
-	if large.len() > length {
-		&large[0..length]
+		let transp_hugepage_enabled = Path::new("/sys/kernel/mm/transparent_hugepage/enabled");
+		if !transp_hugepage_enabled.is_file() {
+			debug!(
+				"`{}` does not exist. Assuming Hugepages are not available",
+				transp_hugepage_enabled.display()
+			);
+			Ok(false)
+		} else {
+			match fs::read_to_string(transp_hugepage_enabled) {
+				Ok(s) => match s.trim() {
+					"[always] madvise never" => Ok(true),
+					"always [madvise] never" => Ok(true),
+					"always madvise [never]" => Ok(false),
+					s => {
+						debug!(
+							"Could not interpret contents of {}: {}",
+							transp_hugepage_enabled.display(),
+							s
+						);
+						Err(io::ErrorKind::InvalidData.into())
+					}
+				},
+				Err(err) => {
+					debug!(
+						"transparent_hugepages_available: Error reading string: {:?}",
+						err
+					);
+					Err(err)
+				}
+			}
+		}
+	} else if cfg!(target_os = "macos") {
+		Ok(true)
 	} else {
-		large
+		panic!("Only linux and macos are supported.")
+	}
+}
+
+/// Parses ranges from strings into discrete steps.
+pub fn parse_ranges<'a>(
+	ranges: impl IntoIterator<Item = &'a str> + 'a,
+) -> impl Iterator<Item = Result<usize, ParseIntError>> + 'a {
+	ranges
+		.into_iter()
+		.map(|range| {
+			let range = match range.split_once('-') {
+				Some((start, end)) => start.parse()?..=end.parse()?,
+				None => {
+					let idx = range.parse()?;
+					idx..=idx
+				}
+			};
+			Ok(range)
+		})
+		.flat_map(|range| match range {
+			Ok(range) => Either::Left(range.map(Ok)),
+			Err(err) => Either::Right(iter::once(Err(err))),
+		})
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn test_parse_cpu_affinity() {
+		assert_eq!(
+			parse_ranges(["8-10", "5", "3", "7-9"])
+				.collect::<Result<Vec<_>, _>>()
+				.unwrap(),
+			[8, 9, 10, 5, 3, 7, 8, 9]
+		);
+
+		parse_ranges(["-1-2", "-5"]).for_each(|res| assert!(res.is_err()));
 	}
 }

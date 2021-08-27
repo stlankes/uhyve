@@ -1,15 +1,16 @@
-use debug_manager::DebugManager;
-use error::*;
+use crate::debug_manager::DebugManager;
+use crate::macos::ioapic::IoApic;
+use crate::macos::vcpu::*;
+use crate::vm::HypervisorResult;
+use crate::vm::{BootInfo, Parameter, VirtualCPU, Vm};
 use libc;
 use libc::c_void;
-use macos::ioapic::IoApic;
-use macos::vcpu::*;
-use std;
+use log::debug;
 use std::net::Ipv4Addr;
+use std::path::PathBuf;
 use std::ptr;
 use std::ptr::read_volatile;
 use std::sync::{Arc, Mutex};
-use vm::{BootInfo, VirtualCPU, Vm, VmParameter};
 use xhypervisor::{create_vm, map_mem, unmap_mem, MemPerm};
 
 pub struct Uhyve {
@@ -17,7 +18,7 @@ pub struct Uhyve {
 	mem_size: usize,
 	guest_mem: *mut c_void,
 	num_cpus: u32,
-	path: String,
+	path: PathBuf,
 	boot_info: *const BootInfo,
 	ioapic: Arc<Mutex<IoApic>>,
 	verbose: bool,
@@ -25,11 +26,7 @@ pub struct Uhyve {
 }
 
 impl Uhyve {
-	pub fn new(
-		kernel_path: String,
-		specs: &VmParameter,
-		dbg: Option<DebugManager>,
-	) -> Result<Uhyve> {
+	pub fn new(kernel_path: PathBuf, specs: &Parameter<'_>) -> HypervisorResult<Uhyve> {
 		let mem = unsafe {
 			libc::mmap(
 				std::ptr::null_mut(),
@@ -41,10 +38,7 @@ impl Uhyve {
 			)
 		};
 
-		if mem == libc::MAP_FAILED {
-			error!("mmap failed with");
-			return Err(Error::NotEnoughMemory);
-		}
+		assert_ne!(libc::MAP_FAILED, mem, "mmap failed");
 
 		debug!("Allocate memory for the guest at 0x{:x}", mem as usize);
 
@@ -60,6 +54,11 @@ impl Uhyve {
 			)?;
 		}
 
+		let dbg = specs
+			.gdbport
+			.map(|port| DebugManager::new(port).unwrap())
+			.map(|g| Arc::new(Mutex::new(g)));
+
 		let hyve = Uhyve {
 			entry_point: 0,
 			mem_size: specs.mem_size,
@@ -69,7 +68,7 @@ impl Uhyve {
 			boot_info: ptr::null(),
 			ioapic: Arc::new(Mutex::new(IoApic::new())),
 			verbose: specs.verbose,
-			dbg: dbg.map(|g| Arc::new(Mutex::new(g))),
+			dbg,
 		};
 
 		hyve.init_guest_mem();
@@ -99,11 +98,11 @@ impl Vm for Uhyve {
 		(self.guest_mem as *mut u8, self.mem_size)
 	}
 
-	fn kernel_path(&self) -> &str {
-		&self.path
+	fn kernel_path(&self) -> PathBuf {
+		self.path.clone()
 	}
 
-	fn create_cpu(&self, id: u32) -> Result<Box<dyn VirtualCPU>> {
+	fn create_cpu(&self, id: u32) -> HypervisorResult<Box<dyn VirtualCPU>> {
 		Ok(Box::new(UhyveCPU::new(
 			id,
 			self.path.clone(),

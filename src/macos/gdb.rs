@@ -1,21 +1,20 @@
+use ::x86::bits64::rflags::RFlags;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
-use error;
+use log::{debug, error};
 use rustc_serialize::hex::ToHex;
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::slice;
-
-use arch::x86;
-use gdb_parser::{
-	Breakpoint, Error, FileData, Handler, Id, MemoryRegion, ProcessInfo, ProcessType, StopReason,
-	ThreadId, VCont, VContFeature, Watchpoint,
-};
-use macos::vcpu::UhyveCPU;
-use utils::get_max_subslice;
-use vm::VirtualCPU;
-use x86::bits64::rflags::RFlags;
 use xhypervisor::{vCPU, x86Reg};
+
+use crate::arch::x86;
+use crate::gdb_parser::{
+	get_max_subslice, Breakpoint, Error, FileData, Handler, Id, MemoryRegion, ProcessInfo,
+	ProcessType, StopReason, ThreadId, VCont, VContFeature, Watchpoint,
+};
+use crate::macos::vcpu::UhyveCPU;
+use crate::vm::VirtualCPU;
 
 /// Debugging Stub for linux/x64
 /// Currently supported features:
@@ -34,7 +33,7 @@ const INT3: &[u8] = &[0xcc];
 impl UhyveCPU {
 	/// Called on Trap. Creates Handler.
 	/// Enter gdb-event-loop until gdb tells us to continue. Set singlestep mode if necessary and return
-	pub fn gdb_handle_exception<'a>(&mut self, signal: bool) {
+	pub fn gdb_handle_exception(&mut self, signal: bool) {
 		debug!("Handling debug exception!");
 		if let Some(dbg) = &mut self.dbg {
 			let dbgarc = dbg.clone();
@@ -47,7 +46,7 @@ impl UhyveCPU {
 					Some(StopReason::Signal(5)),
 				)
 			} else {
-				// target stopped on boot. No signal recv'd yet. Pretend debug singal..? Not used rn anyways
+				// target stopped on boot. No signal recv'd yet. Pretend debug signal? Not used rn anyways.
 				(CmdHandler::new(self, &dbg.state), None)
 			};
 
@@ -67,13 +66,11 @@ impl UhyveCPU {
 			match vcont {
 				VCont::Continue | VCont::ContinueWithSignal(_) => {
 					debug!("Continuing execution..");
-					self.change_guestdbg(false, hwbr.as_ref())
-						.expect("Could not change KVM debugging state"); // TODO: optimize this, dont call too often?
+					self.change_guestdbg(false, hwbr.as_ref()); // TODO: optimize this, don't call too often?
 				}
 				VCont::Step | VCont::StepWithSignal(_) => {
 					debug!("Starting Single Stepping..");
-					self.change_guestdbg(true, hwbr.as_ref())
-						.expect("Could not change KVM debugging state"); // TODO: optimize this, dont call too often?
+					self.change_guestdbg(true, hwbr.as_ref()); // TODO: optimize this, don't call too often?
 				}
 				_ => error!("Unknown Handler exit reason!"),
 			}
@@ -82,14 +79,14 @@ impl UhyveCPU {
 		};
 	}
 
-	pub unsafe fn read_mem(&self, guest_addr: usize, len: usize) -> &[u8] {
+	unsafe fn read_mem(&self, guest_addr: usize, len: usize) -> &[u8] {
 		let phys = self.virt_to_phys(guest_addr);
 		let host = self.host_address(phys);
 
 		slice::from_raw_parts(host as *mut u8, len)
 	}
 
-	pub unsafe fn write_mem(&self, guest_addr: usize, data: &[u8]) {
+	unsafe fn write_mem(&self, guest_addr: usize, data: &[u8]) {
 		let phys = self.virt_to_phys(guest_addr);
 		let host = self.host_address(phys);
 
@@ -102,7 +99,7 @@ impl UhyveCPU {
 		&mut self,
 		single_step: bool,
 		hwbr: Option<&x86::HWBreakpoints>, /*&HashMap<usize, Breakpoint>*/
-	) -> Result<(), error::Error> {
+	) {
 		debug!(
 			"xhypervisor: Enable guest debug. single_step:{}",
 			single_step
@@ -129,11 +126,10 @@ impl UhyveCPU {
 				.unwrap();
 			vcpu.write_register(&x86Reg::DR7, hwbr.get_dr7()).unwrap();
 		}
-
-		Ok(())
 	}
 }
 
+#[derive(Default)]
 pub struct State {
 	breakpoints: HashMap<usize, SWBreakpoint>,
 	breakpoints_hw: HashMap<usize, HWBreakpoint>,
@@ -161,10 +157,7 @@ struct HWBreakpoint {
 
 impl State {
 	pub fn new() -> Self {
-		Self {
-			breakpoints: HashMap::new(),
-			breakpoints_hw: HashMap::new(),
-		}
+		Self::default()
 	}
 
 	pub fn get_hardware_breakpoints(&self) -> Option<x86::HWBreakpoints> {
@@ -458,7 +451,7 @@ impl<'a> Handler for CmdHandler<'a> {
 	/// At most apply one action per thread. GDB likes to send default action for other threads,
 	/// even if it knows only about 1: "vCont;s:1;c" (step thread 1, continue others)
 	fn vcont(&self, actions: Vec<(VCont, Option<ThreadId>)>) -> Result<StopReason, Error> {
-		for (cmd, id) in &actions {
+		actions.into_iter().take(1).for_each(|(cmd, id)| {
 			let _id = id.unwrap_or(ThreadId {
 				pid: Id::All,
 				tid: Id::All,
@@ -470,14 +463,12 @@ impl<'a> Handler for CmdHandler<'a> {
 				(_, Id::Id(tid)) if tid != self.tracee.pid() => continue,
 				(_, _) => (),
 			}*/
-			debug!("vcont: {:?}", *cmd);
+			debug!("vcont: {:?}", cmd);
 			// need to clone, since std::ops::Range<T: Copy> should probably also be Copy, but it isn't.
-			self.continue_execution(cmd.clone());
+			self.continue_execution(cmd);
+		});
 
-			break;
-		}
-
-		// this reason should not matter, since we dont send it when continuing.
+		// This reason should not matter, since we don't send it when continuing.
 		Ok(StopReason::Signal(0))
 	}
 
@@ -599,34 +590,32 @@ pub struct Registers {
 impl Registers {
 	/// Loads the register set from xhypervisor into the register struct
 	pub fn from_xhypervisor(vcpu: &vCPU) -> Self {
-		let mut registers = Registers::default();
-
-		registers.r15 = Some(vcpu.read_register(&x86Reg::R15).unwrap());
-		registers.r14 = Some(vcpu.read_register(&x86Reg::R14).unwrap());
-		registers.r13 = Some(vcpu.read_register(&x86Reg::R13).unwrap());
-		registers.r12 = Some(vcpu.read_register(&x86Reg::R12).unwrap());
-		registers.r11 = Some(vcpu.read_register(&x86Reg::R11).unwrap());
-		registers.r10 = Some(vcpu.read_register(&x86Reg::R10).unwrap());
-		registers.r9 = Some(vcpu.read_register(&x86Reg::R9).unwrap());
-		registers.r8 = Some(vcpu.read_register(&x86Reg::R8).unwrap());
-		registers.rax = Some(vcpu.read_register(&x86Reg::RAX).unwrap());
-		registers.rbx = Some(vcpu.read_register(&x86Reg::RBX).unwrap());
-		registers.rcx = Some(vcpu.read_register(&x86Reg::RCX).unwrap());
-		registers.rdx = Some(vcpu.read_register(&x86Reg::RDX).unwrap());
-		registers.rsi = Some(vcpu.read_register(&x86Reg::RSI).unwrap());
-		registers.rdi = Some(vcpu.read_register(&x86Reg::RDI).unwrap());
-		registers.rsp = Some(vcpu.read_register(&x86Reg::RSP).unwrap());
-		registers.rbp = Some(vcpu.read_register(&x86Reg::RBP).unwrap());
-		registers.rip = Some(vcpu.read_register(&x86Reg::RIP).unwrap());
-		registers.eflags = Some(vcpu.read_register(&x86Reg::RFLAGS).unwrap() as u32);
-		registers.cs = Some(vcpu.read_register(&x86Reg::CS).unwrap() as u32);
-		registers.ss = Some(vcpu.read_register(&x86Reg::SS).unwrap() as u32);
-		registers.ds = Some(vcpu.read_register(&x86Reg::DS).unwrap() as u32);
-		registers.es = Some(vcpu.read_register(&x86Reg::ES).unwrap() as u32);
-		registers.fs = Some(vcpu.read_register(&x86Reg::FS).unwrap() as u32);
-		registers.gs = Some(vcpu.read_register(&x86Reg::GS).unwrap() as u32);
-
-		registers
+		Self {
+			r15: Some(vcpu.read_register(&x86Reg::R15).unwrap()),
+			r14: Some(vcpu.read_register(&x86Reg::R14).unwrap()),
+			r13: Some(vcpu.read_register(&x86Reg::R13).unwrap()),
+			r12: Some(vcpu.read_register(&x86Reg::R12).unwrap()),
+			r11: Some(vcpu.read_register(&x86Reg::R11).unwrap()),
+			r10: Some(vcpu.read_register(&x86Reg::R10).unwrap()),
+			r9: Some(vcpu.read_register(&x86Reg::R9).unwrap()),
+			r8: Some(vcpu.read_register(&x86Reg::R8).unwrap()),
+			rax: Some(vcpu.read_register(&x86Reg::RAX).unwrap()),
+			rbx: Some(vcpu.read_register(&x86Reg::RBX).unwrap()),
+			rcx: Some(vcpu.read_register(&x86Reg::RCX).unwrap()),
+			rdx: Some(vcpu.read_register(&x86Reg::RDX).unwrap()),
+			rsi: Some(vcpu.read_register(&x86Reg::RSI).unwrap()),
+			rdi: Some(vcpu.read_register(&x86Reg::RDI).unwrap()),
+			rsp: Some(vcpu.read_register(&x86Reg::RSP).unwrap()),
+			rbp: Some(vcpu.read_register(&x86Reg::RBP).unwrap()),
+			rip: Some(vcpu.read_register(&x86Reg::RIP).unwrap()),
+			eflags: Some(vcpu.read_register(&x86Reg::RFLAGS).unwrap() as u32),
+			cs: Some(vcpu.read_register(&x86Reg::CS).unwrap() as u32),
+			ss: Some(vcpu.read_register(&x86Reg::SS).unwrap() as u32),
+			ds: Some(vcpu.read_register(&x86Reg::DS).unwrap() as u32),
+			es: Some(vcpu.read_register(&x86Reg::ES).unwrap() as u32),
+			fs: Some(vcpu.read_register(&x86Reg::FS).unwrap() as u32),
+			gs: Some(vcpu.read_register(&x86Reg::GS).unwrap() as u32),
+		}
 	}
 
 	/// Saves a register struct (only where non-None values are) into xhypervisor.
@@ -707,37 +696,33 @@ impl Registers {
 
 	/// take the serialized register set send by gdb and decodes it into a register structure.
 	/// uses little endian, order as specified by gdb arch i386:x86-64
-	pub fn decode(raw: &[u8]) -> Self {
-		let mut registers = Registers::default();
-		let mut raw = raw.clone();
-
-		registers.rax = raw.read_u64::<LittleEndian>().ok();
-		registers.rbx = raw.read_u64::<LittleEndian>().ok();
-		registers.rcx = raw.read_u64::<LittleEndian>().ok();
-		registers.rdx = raw.read_u64::<LittleEndian>().ok();
-		registers.rsi = raw.read_u64::<LittleEndian>().ok();
-		registers.rdi = raw.read_u64::<LittleEndian>().ok();
-		registers.rbp = raw.read_u64::<LittleEndian>().ok();
-		registers.rsp = raw.read_u64::<LittleEndian>().ok();
-		registers.r8 = raw.read_u64::<LittleEndian>().ok();
-		registers.r9 = raw.read_u64::<LittleEndian>().ok();
-		registers.r10 = raw.read_u64::<LittleEndian>().ok();
-		registers.r11 = raw.read_u64::<LittleEndian>().ok();
-		registers.r12 = raw.read_u64::<LittleEndian>().ok();
-		registers.r13 = raw.read_u64::<LittleEndian>().ok();
-		registers.r14 = raw.read_u64::<LittleEndian>().ok();
-		registers.r15 = raw.read_u64::<LittleEndian>().ok();
-		registers.rip = raw.read_u64::<LittleEndian>().ok();
-
-		registers.eflags = raw.read_u32::<LittleEndian>().ok();
-		registers.cs = raw.read_u32::<LittleEndian>().ok();
-		registers.ss = raw.read_u32::<LittleEndian>().ok();
-		registers.ds = raw.read_u32::<LittleEndian>().ok();
-		registers.es = raw.read_u32::<LittleEndian>().ok();
-		registers.fs = raw.read_u32::<LittleEndian>().ok();
-		registers.gs = raw.read_u32::<LittleEndian>().ok();
-
-		registers
+	pub fn decode(mut raw: &[u8]) -> Self {
+		Self {
+			rax: raw.read_u64::<LittleEndian>().ok(),
+			rbx: raw.read_u64::<LittleEndian>().ok(),
+			rcx: raw.read_u64::<LittleEndian>().ok(),
+			rdx: raw.read_u64::<LittleEndian>().ok(),
+			rsi: raw.read_u64::<LittleEndian>().ok(),
+			rdi: raw.read_u64::<LittleEndian>().ok(),
+			rbp: raw.read_u64::<LittleEndian>().ok(),
+			rsp: raw.read_u64::<LittleEndian>().ok(),
+			r8: raw.read_u64::<LittleEndian>().ok(),
+			r9: raw.read_u64::<LittleEndian>().ok(),
+			r10: raw.read_u64::<LittleEndian>().ok(),
+			r11: raw.read_u64::<LittleEndian>().ok(),
+			r12: raw.read_u64::<LittleEndian>().ok(),
+			r13: raw.read_u64::<LittleEndian>().ok(),
+			r14: raw.read_u64::<LittleEndian>().ok(),
+			r15: raw.read_u64::<LittleEndian>().ok(),
+			rip: raw.read_u64::<LittleEndian>().ok(),
+			eflags: raw.read_u32::<LittleEndian>().ok(),
+			cs: raw.read_u32::<LittleEndian>().ok(),
+			ss: raw.read_u32::<LittleEndian>().ok(),
+			ds: raw.read_u32::<LittleEndian>().ok(),
+			es: raw.read_u32::<LittleEndian>().ok(),
+			fs: raw.read_u32::<LittleEndian>().ok(),
+			gs: raw.read_u32::<LittleEndian>().ok(),
+		}
 	}
 
 	/// take the register set and encode it as a u8-vector by concatenating the values

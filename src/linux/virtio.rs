@@ -1,15 +1,14 @@
-use linux::virtqueue::*;
+use crate::linux::virtqueue::*;
+use crate::vm::VirtualCPU;
+use log::info;
+use mac_address::*;
 use std::fmt;
 use std::mem::size_of;
 use std::ptr::copy_nonoverlapping;
 use std::sync::Mutex;
 use std::vec::Vec;
 use tun_tap::*;
-use vm::VirtualCPU;
-extern crate virtio_bindings;
-use self::virtio_bindings::bindings::virtio_net::*;
-extern crate mac_address;
-use self::mac_address::*;
+use virtio_bindings::bindings::virtio_net::*;
 
 const STATUS_ACKNOWLEDGE: u8 = 0b00000001;
 const STATUS_DRIVER: u8 = 0b00000010;
@@ -47,8 +46,8 @@ pub const VIRTIO_PCI_LINK_STATUS_MSIX_OFF: u16 = ETHARP_HWADDR_LEN + VIRTIO_PCI_
 const HOST_FEATURES: u32 = (1 << VIRTIO_NET_F_STATUS) | (1 << VIRTIO_NET_F_MAC);
 
 pub trait PciDevice {
-	fn handle_read(&self, address: u32, dest: &mut [u8]) -> ();
-	fn handle_write(&mut self, address: u32, src: &[u8]) -> ();
+	fn handle_read(&self, address: u32, dest: &mut [u8]);
+	fn handle_write(&mut self, address: u32, src: &[u8]);
 }
 
 type PciRegisters = [u8; 0x40];
@@ -78,7 +77,7 @@ macro_rules! write_u16 {
 	($registers:expr, $address:expr, $value:expr) => {
 		$registers[$address] = ($value & 0xFF) as u8;
 		$registers[$address + 1] = (($value >> 8) & 0xFF) as u8;
-			()
+		()
 	};
 }
 
@@ -98,16 +97,16 @@ macro_rules! write_u32 {
 		$registers[$address + 1] = (($value >> 8) & 0xFF) as u8;
 		$registers[$address + 2] = (($value >> 16) & 0xFF) as u8;
 		$registers[$address + 3] = (($value >> 24) & 0xFF) as u8;
-			()
+		()
 	};
 }
 
 impl VirtioNetPciDevice {
 	pub const fn new() -> VirtioNetPciDevice {
 		let mut registers: PciRegisters = [0; 0x40];
-		write_u16!(registers, VENDOR_ID_REGISTER, 0x1AF4 as u16);
-		write_u16!(registers, DEVICE_ID_REGISTER, 0x1000 as u16);
-		write_u16!(registers, CLASS_REGISTER + 2, 0x0200 as u16);
+		write_u16!(registers, VENDOR_ID_REGISTER, 0x1AF4);
+		write_u16!(registers, DEVICE_ID_REGISTER, 0x1000);
+		write_u16!(registers, CLASS_REGISTER + 2, 0x0200);
 		write_u16!(registers, BAR0_REGISTER, IOBASE as u16);
 		registers[STATUS_REGISTER as usize] = STATUS_DRIVER_NEEDS_RESET;
 		let virt_queues: Vec<Virtqueue> = Vec::new();
@@ -127,7 +126,7 @@ impl VirtioNetPciDevice {
 
 	pub fn handle_notify_output(&mut self, dest: &[u8], cpu: &dyn VirtualCPU) {
 		let tx_num = read_u16!(dest, 0);
-		if tx_num == 1 && self.read_status_reg() & STATUS_DRIVER_OK == 1 {
+		if tx_num == 1 && self.read_status_reg() & STATUS_DRIVER_OK == STATUS_DRIVER_OK {
 			self.send_available_packets(cpu);
 		}
 	}
@@ -135,15 +134,9 @@ impl VirtioNetPciDevice {
 	// Sends packets using the tun_tap crate, subject to change
 	fn send_available_packets(&mut self, cpu: &dyn VirtualCPU) {
 		let tx_queue = &mut self.virt_queues[TX_QUEUE];
-		let mut iter = tx_queue.avail_iter();
 		let mut send_indices = Vec::new();
-		loop {
-			match iter.next() {
-				Some(index) => {
-					send_indices.push(index);
-				}
-				None => break,
-			}
+		for index in tx_queue.avail_iter() {
+			send_indices.push(index);
 		}
 		for index in send_indices {
 			let desc = unsafe { tx_queue.get_descriptor(index) };
@@ -264,7 +257,10 @@ impl VirtioNetPciDevice {
 	}
 
 	pub fn write_selected_queue(&mut self, dest: &[u8]) {
-		self.selected_queue_num = unsafe { *(dest.as_ptr() as *const u16) };
+		self.selected_queue_num = unsafe {
+			#[allow(clippy::cast_ptr_alignment)]
+			*(dest.as_ptr() as *const u16)
+		};
 	}
 
 	// Register virtqueue
@@ -274,16 +270,22 @@ impl VirtioNetPciDevice {
 			&& status & STATUS_DRIVER_OK == 0
 			&& self.selected_queue_num as usize == self.virt_queues.len()
 		{
-			let gpa = unsafe { *(dest.as_ptr() as *const usize) };
+			let gpa = unsafe {
+				#[allow(clippy::cast_ptr_alignment)]
+				*(dest.as_ptr() as *const usize)
+			};
 			let hva = (*vcpu).host_address(gpa) as *mut u8;
-			let queue = Virtqueue::new(hva, QUEUE_LIMIT);
+			let queue = unsafe { Virtqueue::new(hva, QUEUE_LIMIT) };
 			self.virt_queues.push(queue);
 		}
 	}
 
 	pub fn write_requested_features(&mut self, dest: &[u8]) {
 		if self.read_status_reg() == STATUS_ACKNOWLEDGE | STATUS_DRIVER {
-			let requested_features = unsafe { *(dest.as_ptr() as *const u32) };
+			let requested_features = unsafe {
+				#[allow(clippy::cast_ptr_alignment)]
+				*(dest.as_ptr() as *const u32)
+			};
 			self.requested_features =
 				(self.requested_features | requested_features) & HOST_FEATURES;
 		}
@@ -292,9 +294,7 @@ impl VirtioNetPciDevice {
 	pub fn read_requested_features(&mut self, dest: &mut [u8]) {
 		if self.read_status_reg() == STATUS_ACKNOWLEDGE | STATUS_DRIVER {
 			let bytes = self.requested_features.to_ne_bytes();
-			for i in 0..bytes.len() {
-				dest[i] = bytes[i];
-			}
+			dest[0..(bytes.len())].clone_from_slice(&bytes[..]);
 		}
 	}
 
@@ -312,9 +312,7 @@ impl VirtioNetPciDevice {
 
 	pub fn read_host_features(&self, dest: &mut [u8]) {
 		let bytes = HOST_FEATURES.to_ne_bytes();
-		for i in 0..bytes.len() {
-			dest[i] = bytes[i];
-		}
+		dest[0..(bytes.len())].clone_from_slice(&bytes[..]);
 	}
 
 	pub fn reset_interrupt(&mut self) {
@@ -323,17 +321,13 @@ impl VirtioNetPciDevice {
 }
 
 impl PciDevice for VirtioNetPciDevice {
-	fn handle_read(&self, address: u32, dest: &mut [u8]) -> () {
-		for i in 0..dest.len() {
-			dest[i] = self.registers[(address as usize) + i];
-		}
-		()
+	fn handle_read(&self, address: u32, dest: &mut [u8]) {
+		dest.copy_from_slice(&self.registers[address as usize..][..dest.len()]);
 	}
 
-	fn handle_write(&mut self, address: u32, dest: &[u8]) -> () {
+	fn handle_write(&mut self, address: u32, dest: &[u8]) {
 		for (i, var) in dest.iter().enumerate() {
 			self.registers[(address as usize) + i] = *var;
 		}
-		()
 	}
 }

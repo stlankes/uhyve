@@ -18,14 +18,31 @@
 //#![allow(dead_code)]
 
 use gdb_protocol::io::BUF_SIZE;
+use log::{debug, info, trace};
 use nom::IResult::*;
+use nom::{
+	alt, alt_complete, call, complete, do_parse, error_position, flat_map, is_not, is_not_s, many0,
+	many1, map, map_res, named, one_of, opt, preceded, separated_list, separated_list_complete,
+	separated_nonempty_list, separated_nonempty_list_complete, separated_pair, tag, take,
+	take_till, take_while1, try_parse, tuple, tuple_parser,
+};
 use nom::{IResult, Needed};
+use rustc_serialize::hex::ToHex;
 use std::borrow::Cow;
 use std::convert::From;
 use std::ops::Range;
 use std::str::{self, FromStr};
+use strum_macros::EnumString;
 
-use rustc_serialize::hex::ToHex;
+/// returns subslice of s at given offset of at most given length. If offset OOB, return empty slice
+pub fn get_max_subslice(s: &str, offset: usize, length: usize) -> &str {
+	let large = s.get(offset..s.len()).unwrap_or("");
+	if large.len() > length {
+		&large[0..length]
+	} else {
+		large
+	}
+}
 
 #[allow(non_camel_case_types)]
 #[derive(Copy, Clone, Debug, EnumString, PartialEq)]
@@ -332,7 +349,7 @@ enum Command<'a> {
 }
 
 named!(
-	gdbfeature<Known>,
+	gdbfeature<Known<'_>>,
 	map!(map_res!(is_not_s!(";="), str::from_utf8), |s| {
 		match GDBFeature::from_str(s) {
 			Ok(f) => Known::Yes(f),
@@ -517,7 +534,7 @@ named!(parse_thread_id_element<&[u8], Id>,
 
 // Parse a thread-id.
 named!(parse_thread_id<&[u8], ThreadId>,
-alt_complete!(parse_thread_id_element => { |pid| ThreadId { pid: pid, tid: Id::Any } }
+alt_complete!(parse_thread_id_element => { |pid| ThreadId { pid, tid: Id::Any } }
 			  | preceded!(tag!("p"),
 						  separated_pair!(parse_thread_id_element,
 										  tag!("."),
@@ -532,7 +549,7 @@ alt_complete!(parse_thread_id_element => { |pid| ThreadId { pid: pid, tid: Id::A
 named!(parse_ping_thread<&[u8], ThreadId>,
 	   preceded!(tag!("T"), parse_thread_id));
 
-fn v_command<'a>(i: &'a [u8]) -> IResult<&'a [u8], Command<'a>> {
+fn v_command(i: &[u8]) -> IResult<&[u8], Command<'_>> {
 	alt_complete!(i,
 	tag!("vCtrlC") => { |_| Command::CtrlC }
 	| preceded!(tag!("vCont"),
@@ -614,7 +631,7 @@ named!(parse_condition_list<&[u8], Vec<Bytecode>>,
 				 list: many1!(parse_cond_or_command_expression) >>
 				 (list)));
 
-fn maybe_condition_list<'a>(i: &'a [u8]) -> IResult<&'a [u8], Option<Vec<Bytecode>>> {
+fn maybe_condition_list(i: &[u8]) -> IResult<&[u8], Option<Vec<Bytecode>>> {
 	// An Incomplete here really means "not enough input to match a
 	// condition list", and that's OK.  An Error is *probably* that the
 	// input contains a command list rather than a condition list; the
@@ -637,7 +654,7 @@ named!(parse_command_list<&[u8], Vec<Bytecode>>,
 									 many1!(parse_cond_or_command_expression)) >>
 				 (list)));
 
-fn maybe_command_list<'a>(i: &'a [u8]) -> IResult<&'a [u8], Option<Vec<Bytecode>>> {
+fn maybe_command_list(i: &[u8]) -> IResult<&[u8], Option<Vec<Bytecode>>> {
 	// An Incomplete here really means "not enough input to match a
 	// command list", and that's OK.
 	match parse_command_list(i) {
@@ -653,7 +670,7 @@ named!(parse_cond_and_command_list<&[u8], (Option<Vec<Bytecode>>,
 				 cmd_list: maybe_command_list >>
 				 (cond_list, cmd_list)));
 
-fn parse_z_packet<'a>(i: &'a [u8]) -> IResult<&'a [u8], Command<'a>> {
+fn parse_z_packet(i: &[u8]) -> IResult<&[u8], Command<'_>> {
 	let (rest, (action, type_, addr, kind)) = try_parse!(
 		i,
 		do_parse!(
@@ -670,12 +687,12 @@ fn parse_z_packet<'a>(i: &'a [u8]) -> IResult<&'a [u8], Command<'a>> {
 		ZAction::Remove => Done(rest, remove_command(type_, addr, kind)),
 	};
 
-	fn insert_command<'a>(
-		rest: &'a [u8],
+	fn insert_command(
+		rest: &[u8],
 		type_: ZType,
 		addr: u64,
 		kind: u64,
-	) -> IResult<&'a [u8], Command<'a>> {
+	) -> IResult<&[u8], Command<'_>> {
 		match type_ {
 			// Software and hardware breakpoints both permit optional condition
 			// lists and commands that are evaluated on the target when
@@ -720,7 +737,7 @@ fn parse_z_packet<'a>(i: &'a [u8]) -> IResult<&'a [u8], Command<'a>> {
 	}
 }
 
-fn command<'a>(i: &'a [u8]) -> IResult<&'a [u8], Command<'a>> {
+fn command(i: &[u8]) -> IResult<&[u8], Command<'_>> {
 	alt!(i,
 		 tag!("!") => { |_|   Command::EnableExtendedMode }
 		 | tag!("?") => { |_| Command::TargetHaltReason }
@@ -923,7 +940,7 @@ pub trait Handler {
 	/// (typically ASCII characters), to be interpreted by the server
 	/// in any way it likes.  The result is output to send back to the
 	/// client.  This is used to implement gdb's `monitor` command.
-	fn invoke(&self, &[u8]) -> Result<String, Error> {
+	fn invoke(&self, _: &[u8]) -> Result<String, Error> {
 		Err(Error::Unimplemented)
 	}
 
@@ -1141,7 +1158,7 @@ impl<'a> From<StopReason> for Response<'a> {
 
 impl<'a> From<String> for Response<'a> {
 	fn from(reason: String) -> Self {
-		Response::String(Cow::Owned(reason) as Cow<str>)
+		Response::String(Cow::Owned(reason) as Cow<'_, str>)
 	}
 }
 
@@ -1176,7 +1193,7 @@ fn get_thread_id(thread_id: ThreadId) -> String {
 	tid.push_str(".");*/
 	match thread_id.tid {
 		Id::All => tid.push_str("-1"),
-		Id::Any => tid.push_str("0"),
+		Id::Any => tid.push('0'),
 		Id::Id(num) => tid.push_str(&format!("{:x}", num)),
 	};
 	tid
@@ -1187,7 +1204,7 @@ fn get_process_info(p: &ProcessInfo) -> String {
 	out.push_str("pid:");
 	match p.pid {
 		Id::All => out.push_str("-1"),
-		Id::Any => out.push_str("0"),
+		Id::Any => out.push('0'),
 		Id::Id(num) => out.push_str(&format!("{:x}", num)),
 	};
 	out.push_str(&format!("name:{}", p.name));
@@ -1197,7 +1214,7 @@ fn get_process_info(p: &ProcessInfo) -> String {
 
 /// get a byte vector we can send to remote from a response
 impl<'a> From<Response<'a>> for Vec<u8> {
-	fn from(response: Response) -> Vec<u8> {
+	fn from(response: Response<'_>) -> Vec<u8> {
 		trace!("Response: {:?}", response);
 
 		let mut rsp = String::new();
@@ -1207,7 +1224,7 @@ impl<'a> From<Response<'a>> for Vec<u8> {
 			Response::Error(val) => format!("E{:02x}", val),
 			Response::String(s) => format!("{}", s),
 			Response::Output(s) => format!("O{}", s.as_bytes().to_hex()),
-			Response::Bytes(bytes) => bytes.to_hex().to_string(),
+			Response::Bytes(bytes) => bytes.to_hex(),
 			Response::File(data) => {
 				if data.0.is_empty() {
 					"l".into()
@@ -1261,11 +1278,11 @@ impl<'a> From<Response<'a>> for Vec<u8> {
 				if threads.is_empty() {
 					"l".into()
 				} else {
-					rsp.push_str("m");
+					rsp.push('m');
 					for (i, &id) in threads.iter().enumerate() {
 						// Write separator
 						if i != 0 {
-							rsp.push_str(",");
+							rsp.push(',');
 						}
 						rsp.push_str(&get_thread_id(id));
 					}
@@ -1276,11 +1293,11 @@ impl<'a> From<Response<'a>> for Vec<u8> {
 				if procs.is_empty() {
 					"E00".into() // lldb spec just says error Exx where xx is hex
 				} else {
-					rsp.push_str("m");
+					rsp.push('m');
 					for (i, p) in procs.iter().enumerate() {
 						// Write separator
 						if i != 0 {
-							rsp.push_str(",");
+							rsp.push(',');
 						}
 						rsp.push_str(&get_process_info(p));
 					}
@@ -1295,7 +1312,7 @@ impl<'a> From<Response<'a>> for Vec<u8> {
 
 fn handle_supported_features<'a, H>(
 	handler: &H,
-	_features: &Vec<GDBFeatureSupported<'a>>,
+	_features: &[GDBFeatureSupported<'a>],
 ) -> Response<'static>
 where
 	H: Handler,
@@ -1311,7 +1328,7 @@ where
 	];
 	let mut new_features = handler.query_supported_features();
 	features.append(&mut new_features);
-	Response::String(Cow::Owned(features.join(";")) as Cow<str>)
+	Response::String(Cow::Owned(features.join(";")) as Cow<'_, str>)
 }
 
 /// Handle a single packet `data` with `handler` and return response
@@ -1703,7 +1720,7 @@ fn test_parse_d_packets() {
 fn test_parse_write_memory() {
 	assert_eq!(
 		write_memory(&b"Mf0,3:ff0102"[..]),
-		Done(&b""[..], (240, 3, vec!(255, 1, 2)))
+		Done(&b""[..], (240, 3, vec![255, 1, 2]))
 	);
 }
 
@@ -1711,23 +1728,23 @@ fn test_parse_write_memory() {
 fn test_parse_write_memory_binary() {
 	assert_eq!(
 		write_memory_binary(&b"Xf0,1: "[..]),
-		Done(&b""[..], (240, 1, vec!(0x20)))
+		Done(&b""[..], (240, 1, vec![0x20]))
 	);
 	assert_eq!(
 		write_memory_binary(&b"X90,10:}\x5d"[..]),
-		Done(&b""[..], (144, 16, vec!(0x7d)))
+		Done(&b""[..], (144, 16, vec![0x7d]))
 	);
 	assert_eq!(
 		write_memory_binary(&b"X5,100:}\x5d}\x03"[..]),
-		Done(&b""[..], (5, 256, vec!(0x7d, 0x23)))
+		Done(&b""[..], (5, 256, vec![0x7d, 0x23]))
 	);
 	assert_eq!(
 		write_memory_binary(&b"Xff,2:}\x04\x9a"[..]),
-		Done(&b""[..], (255, 2, vec!(0x24, 0x9a)))
+		Done(&b""[..], (255, 2, vec![0x24, 0x9a]))
 	);
 	assert_eq!(
 		write_memory_binary(&b"Xff,2:\xce}\x0a\x9a"[..]),
-		Done(&b""[..], (255, 2, vec!(0xce, 0x2a, 0x9a)))
+		Done(&b""[..], (255, 2, vec![0xce, 0x2a, 0x9a]))
 	);
 }
 
@@ -1759,11 +1776,11 @@ fn test_parse_syscalls() {
 	);
 	assert_eq!(
 		query(&b"QCatchSyscalls:1"[..]),
-		Done(&b""[..], Query::CatchSyscalls(Some(vec!())))
+		Done(&b""[..], Query::CatchSyscalls(Some(vec![])))
 	);
 	assert_eq!(
 		query(&b"QCatchSyscalls:1;0;1;ff"[..]),
-		Done(&b""[..], Query::CatchSyscalls(Some(vec!(0, 1, 255))))
+		Done(&b""[..], Query::CatchSyscalls(Some(vec![0, 1, 255])))
 	);
 }
 
@@ -1771,23 +1788,23 @@ fn test_parse_syscalls() {
 fn test_parse_signals() {
 	assert_eq!(
 		query(&b"QPassSignals:"[..]),
-		Done(&b""[..], Query::PassSignals(vec!()))
+		Done(&b""[..], Query::PassSignals(vec![]))
 	);
 	assert_eq!(
 		query(&b"QPassSignals:0"[..]),
-		Done(&b""[..], Query::PassSignals(vec!(0)))
+		Done(&b""[..], Query::PassSignals(vec![0]))
 	);
 	assert_eq!(
 		query(&b"QPassSignals:1;2;ff"[..]),
-		Done(&b""[..], Query::PassSignals(vec!(1, 2, 255)))
+		Done(&b""[..], Query::PassSignals(vec![1, 2, 255]))
 	);
 	assert_eq!(
 		query(&b"QProgramSignals:0"[..]),
-		Done(&b""[..], Query::ProgramSignals(vec!(0)))
+		Done(&b""[..], Query::ProgramSignals(vec![0]))
 	);
 	assert_eq!(
 		query(&b"QProgramSignals:1;2;ff"[..]),
-		Done(&b""[..], Query::ProgramSignals(vec!(1, 2, 255)))
+		Done(&b""[..], Query::ProgramSignals(vec![1, 2, 255]))
 	);
 }
 
@@ -1821,7 +1838,7 @@ fn test_thread_list() {
 fn test_parse_write_register() {
 	assert_eq!(
 		write_register(&b"Pff=1020"[..]),
-		Done(&b""[..], (255, vec!(16, 32)))
+		Done(&b""[..], (255, vec![16, 32]))
 	);
 }
 
@@ -1829,14 +1846,14 @@ fn test_parse_write_register() {
 fn test_parse_write_general_registers() {
 	assert_eq!(
 		write_general_registers(&b"G0001020304"[..]),
-		Done(&b""[..], vec!(0, 1, 2, 3, 4))
+		Done(&b""[..], vec![0, 1, 2, 3, 4])
 	);
 }
 
 #[cfg(test)]
 macro_rules! bytecode {
 	($elem:expr; $n:expr) => (Bytecode { bytecode: vec![$elem; $n] });
-	($($x:expr),*) => (Bytecode { bytecode: vec!($($x),*) })
+	($($x:expr),*) => (Bytecode { bytecode: vec![$($x),*] })
 }
 
 #[test]
@@ -1919,7 +1936,7 @@ fn test_breakpoints() {
 			Command::InsertSoftwareBreakpoint(Breakpoint::new(
 				0x1ff,
 				2,
-				Some(vec!(bytecode!('0' as u8))),
+				Some(vec![bytecode!(b'0')]),
 				None
 			))
 		)
@@ -1931,7 +1948,7 @@ fn test_breakpoints() {
 			Command::InsertHardwareBreakpoint(Breakpoint::new(
 				0x1ff,
 				2,
-				Some(vec!(bytecode!('0' as u8))),
+				Some(vec![bytecode!(b'0')]),
 				None
 			))
 		)
@@ -1945,7 +1962,7 @@ fn test_breakpoints() {
 				0x1ff,
 				2,
 				None,
-				Some(vec!(bytecode!('z' as u8)))
+				Some(vec![bytecode!(b'z')])
 			))
 		)
 	);
@@ -1957,7 +1974,7 @@ fn test_breakpoints() {
 				0x1ff,
 				2,
 				None,
-				Some(vec!(bytecode!('z' as u8)))
+				Some(vec![bytecode!(b'z')])
 			))
 		)
 	);
@@ -1969,8 +1986,8 @@ fn test_breakpoints() {
 			Command::InsertSoftwareBreakpoint(Breakpoint::new(
 				0x1ff,
 				2,
-				Some(vec!(bytecode!('0' as u8))),
-				Some(vec!(bytecode!('a' as u8)))
+				Some(vec![bytecode!(b'0')]),
+				Some(vec![bytecode!(b'a')])
 			))
 		)
 	);
@@ -1981,8 +1998,8 @@ fn test_breakpoints() {
 			Command::InsertHardwareBreakpoint(Breakpoint::new(
 				0x1ff,
 				2,
-				Some(vec!(bytecode!('0' as u8))),
-				Some(vec!(bytecode!('a' as u8)))
+				Some(vec![bytecode!(b'0')]),
+				Some(vec![bytecode!(b'a')])
 			))
 		)
 	);
@@ -1992,41 +2009,35 @@ fn test_breakpoints() {
 fn test_cond_or_command_list() {
 	assert_eq!(
 		parse_condition_list(&b";X1,a"[..]),
-		Done(&b""[..], vec!(bytecode!('a' as u8)))
+		Done(&b""[..], vec![bytecode!(b'a')])
 	);
 	assert_eq!(
 		parse_condition_list(&b";X2,ab"[..]),
-		Done(&b""[..], vec!(bytecode!('a' as u8, 'b' as u8)))
+		Done(&b""[..], vec![bytecode!(b'a', b'b')])
 	);
 	assert_eq!(
 		parse_condition_list(&b";X1,zX1,y"[..]),
-		Done(&b""[..], vec!(bytecode!('z' as u8), bytecode!('y' as u8)))
+		Done(&b""[..], vec![bytecode!(b'z'), bytecode!(b'y')])
 	);
 	assert_eq!(
 		parse_condition_list(&b";X1,zX10,yyyyyyyyyyyyyyyy"[..]),
-		Done(
-			&b""[..],
-			vec!(bytecode!('z' as u8), bytecode!['y' as u8; 16])
-		)
+		Done(&b""[..], vec![bytecode!(b'z'), bytecode![b'y'; 16]])
 	);
 
 	assert_eq!(
 		parse_command_list(&b";cmdsX1,a"[..]),
-		Done(&b""[..], vec!(bytecode!('a' as u8)))
+		Done(&b""[..], vec![bytecode!(b'a')])
 	);
 	assert_eq!(
 		parse_command_list(&b";cmdsX2,ab"[..]),
-		Done(&b""[..], vec!(bytecode!('a' as u8, 'b' as u8)))
+		Done(&b""[..], vec![bytecode!(b'a', b'b')])
 	);
 	assert_eq!(
 		parse_command_list(&b";cmdsX1,zX1,y"[..]),
-		Done(&b""[..], vec!(bytecode!('z' as u8), bytecode!('y' as u8)))
+		Done(&b""[..], vec![bytecode!(b'z'), bytecode!(b'y')])
 	);
 	assert_eq!(
 		parse_command_list(&b";cmdsX1,zX10,yyyyyyyyyyyyyyyy"[..]),
-		Done(
-			&b""[..],
-			vec!(bytecode!('z' as u8), bytecode!['y' as u8; 16])
-		)
+		Done(&b""[..], vec![bytecode!(b'z'), bytecode![b'y'; 16]])
 	);
 }

@@ -1,30 +1,31 @@
 //! This file contains the entry point to the Hypervisor. The Uhyve utilizes KVM to
 //! create a Virtual Machine and load the kernel.
 
-use consts::*;
-use debug_manager::DebugManager;
-use error::*;
+use crate::consts::*;
+use crate::debug_manager::DebugManager;
+use crate::linux::vcpu::*;
+use crate::linux::virtio::*;
+use crate::linux::{MemoryRegion, KVM};
+use crate::shared_queue::*;
+use crate::vm::HypervisorResult;
+use crate::vm::{BootInfo, Parameter, VirtualCPU, Vm};
 use kvm_bindings::*;
 use kvm_ioctls::VmFd;
-use linux::vcpu::*;
-use linux::virtio::*;
-use linux::{MemoryRegion, KVM};
+use log::debug;
 use nix::sys::mman::*;
-use shared_queue::*;
-use std;
 use std::convert::TryInto;
+use std::hint;
 use std::mem;
 use std::net::Ipv4Addr;
 use std::os::raw::c_void;
+use std::path::PathBuf;
 use std::ptr;
 use std::ptr::{read_volatile, write_volatile};
 use std::str::FromStr;
-use std::sync::atomic::spin_loop_hint;
 use std::sync::mpsc::sync_channel;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use tun_tap::{Iface, Mode};
-use vm::{BootInfo, VirtualCPU, Vm, VmParameter};
 use vmm_sys_util::eventfd::EventFd;
 
 const KVM_32BIT_MAX_MEM_SIZE: usize = 1 << 32;
@@ -32,7 +33,9 @@ const KVM_32BIT_GAP_SIZE: usize = 768 << 20;
 const KVM_32BIT_GAP_START: usize = KVM_32BIT_MAX_MEM_SIZE - KVM_32BIT_GAP_SIZE;
 
 struct UhyveNetwork {
+	#[allow(dead_code)]
 	reader: std::thread::JoinHandle<()>,
+	#[allow(dead_code)]
 	writer: std::thread::JoinHandle<()>,
 	tx: std::sync::mpsc::SyncSender<usize>,
 }
@@ -40,8 +43,7 @@ struct UhyveNetwork {
 impl UhyveNetwork {
 	pub fn new(evtfd: EventFd, name: String, start: usize) -> Self {
 		let iface = Arc::new(
-			Iface::without_packet_info(&name.to_owned(), Mode::Tap)
-				.expect("Unable to creat TUN/TAP device"),
+			Iface::without_packet_info(&name, Mode::Tap).expect("Unable to creat TUN/TAP device"),
 		);
 
 		let iface_writer = Arc::clone(&iface);
@@ -50,6 +52,7 @@ impl UhyveNetwork {
 
 		let writer = thread::spawn(move || {
 			let tx_queue = unsafe {
+				#[allow(clippy::cast_ptr_alignment)]
 				&mut *((start + align_up!(mem::size_of::<SharedQueue>(), 64)) as *mut u8
 					as *mut SharedQueue)
 			};
@@ -66,7 +69,7 @@ impl UhyveNetwork {
 					let idx = read % UHYVE_QUEUE_SIZE;
 					let len = unsafe { read_volatile(&tx_queue.inner[idx].len) } as usize;
 					let _ = iface_writer
-						.send(&mut tx_queue.inner[idx].data[0..len])
+						.send(&tx_queue.inner[idx].data[0..len])
 						.expect("Send on TUN/TAP device failed!");
 
 					unsafe { write_volatile(&mut tx_queue.read, read + 1) };
@@ -75,7 +78,10 @@ impl UhyveNetwork {
 		});
 
 		let reader = thread::spawn(move || {
-			let rx_queue = unsafe { &mut *(start as *mut u8 as *mut SharedQueue) };
+			let rx_queue = unsafe {
+				#[allow(clippy::cast_ptr_alignment)]
+				&mut *(start as *mut u8 as *mut SharedQueue)
+			};
 			rx_queue.init();
 
 			loop {
@@ -99,16 +105,12 @@ impl UhyveNetwork {
 
 					evtfd.write(1).expect("Unable to trigger interrupt");
 				} else {
-					spin_loop_hint();
+					hint::spin_loop();
 				}
 			}
 		});
 
-		UhyveNetwork {
-			reader: reader,
-			writer: writer,
-			tx: tx.clone(),
-		}
+		UhyveNetwork { reader, writer, tx }
 	}
 }
 
@@ -123,7 +125,7 @@ pub struct Uhyve {
 	entry_point: u64,
 	mem: MmapMemory,
 	num_cpus: u32,
-	path: String,
+	path: PathBuf,
 	boot_info: *const BootInfo,
 	verbose: bool,
 	ip: Option<Ipv4Addr>,
@@ -135,36 +137,26 @@ pub struct Uhyve {
 }
 
 impl Uhyve {
-	pub fn new(
-		kernel_path: String,
-		specs: &VmParameter,
-		dbg: Option<DebugManager>,
-	) -> Result<Uhyve> {
+	pub fn new(kernel_path: PathBuf, specs: &Parameter<'_>) -> HypervisorResult<Uhyve> {
 		// parse string to get IP address
-		let ip_addr = match &specs.ip {
-			Some(addr_str) => {
-				Some(Ipv4Addr::from_str(addr_str).expect("Unable to parse ip address"))
-			}
-			_ => None,
-		};
+		let ip_addr = specs
+			.ip
+			.as_ref()
+			.map(|addr_str| Ipv4Addr::from_str(addr_str).expect("Unable to parse ip address"));
 
 		// parse string to get gateway address
-		let gw_addr = match &specs.gateway {
-			Some(addr_str) => {
-				Some(Ipv4Addr::from_str(addr_str).expect("Unable to parse gateway address"))
-			}
-			_ => None,
-		};
+		let gw_addr = specs
+			.gateway
+			.as_ref()
+			.map(|addr_str| Ipv4Addr::from_str(addr_str).expect("Unable to parse gateway address"));
 
 		// parse string to get gateway address
-		let mask = match &specs.mask {
-			Some(addr_str) => {
-				Some(Ipv4Addr::from_str(addr_str).expect("Unable to parse network parse"))
-			}
-			_ => None,
-		};
+		let mask = specs
+			.mask
+			.as_ref()
+			.map(|addr_str| Ipv4Addr::from_str(addr_str).expect("Unable to parse network parse"));
 
-		let vm = KVM.create_vm().or_else(to_error)?;
+		let vm = KVM.create_vm()?;
 
 		let mem = MmapMemory::new(0, specs.mem_size, 0, specs.hugepage, specs.mergeable);
 
@@ -185,7 +177,7 @@ impl Uhyve {
 			userspace_addr: mem.host_address() as u64,
 		};
 
-		unsafe { vm.set_user_memory_region(kvm_mem) }.or_else(to_error)?;
+		unsafe { vm.set_user_memory_region(kvm_mem) }?;
 
 		if specs.mem_size > KVM_32BIT_GAP_START + KVM_32BIT_GAP_SIZE {
 			let kvm_mem = kvm_userspace_memory_region {
@@ -198,44 +190,59 @@ impl Uhyve {
 					as u64,
 			};
 
-			unsafe { vm.set_user_memory_region(kvm_mem) }.or_else(to_error)?;
+			unsafe { vm.set_user_memory_region(kvm_mem) }?;
 		}
 
 		debug!("Initialize interrupt controller");
 
 		// create basic interrupt controller
-		vm.create_irq_chip().or_else(to_error)?;
+		vm.create_irq_chip()?;
 
 		// enable x2APIC support
-		let mut cap: kvm_enable_cap = Default::default();
-		cap.cap = KVM_CAP_X2APIC_API;
-		cap.flags = 0;
+		let mut cap: kvm_enable_cap = kvm_bindings::kvm_enable_cap {
+			cap: KVM_CAP_X2APIC_API,
+			flags: 0,
+			..Default::default()
+		};
 		cap.args[0] =
-			(KVM_X2APIC_API_USE_32BIT_IDS | KVM_X2APIC_API_DISABLE_BROADCAST_QUIRK) as u64;
+			(KVM_X2APIC_API_USE_32BIT_IDS | KVM_X2APIC_API_DISABLE_BROADCAST_QUIRK).into();
 		vm.enable_cap(&cap)
 			.expect("Unable to enable x2apic support");
 
 		// currently, we support only system, which provides the
 		// cpu feature TSC_DEADLINE
-		let mut cap: kvm_enable_cap = Default::default();
-		cap.cap = KVM_CAP_TSC_DEADLINE_TIMER;
+		let mut cap: kvm_enable_cap = kvm_bindings::kvm_enable_cap {
+			cap: KVM_CAP_TSC_DEADLINE_TIMER,
+			..Default::default()
+		};
 		cap.args[0] = 0;
-		if vm.enable_cap(&cap).is_ok() {
-			panic!("Processor feature \"tsc deadline\" isn't supported!")
-		}
+		vm.enable_cap(&cap)
+			.expect_err("Processor feature `tsc deadline` isn't supported!");
 
-		let mut cap: kvm_enable_cap = Default::default();
-		cap.cap = KVM_CAP_IRQFD;
-		if vm.enable_cap(&cap).is_ok() {
-			panic!("The support of KVM_CAP_IRQFD is curently required");
-		}
+		let cap: kvm_enable_cap = kvm_bindings::kvm_enable_cap {
+			cap: KVM_CAP_IRQFD,
+			..Default::default()
+		};
+		vm.enable_cap(&cap)
+			.expect_err("The support of KVM_CAP_IRQFD is currently required");
+
+		let mut cap: kvm_enable_cap = kvm_bindings::kvm_enable_cap {
+			cap: KVM_CAP_X86_DISABLE_EXITS,
+			flags: 0,
+			..Default::default()
+		};
+		cap.args[0] =
+			(KVM_X86_DISABLE_EXITS_PAUSE | KVM_X86_DISABLE_EXITS_MWAIT | KVM_X86_DISABLE_EXITS_HLT)
+				.into();
+		vm.enable_cap(&cap)
+			.expect("Unable to disable exists due pause instructions");
 
 		let evtfd = EventFd::new(0).unwrap();
-		vm.register_irqfd(&evtfd, UHYVE_IRQ_NET).or_else(to_error)?;
+		vm.register_irqfd(&evtfd, UHYVE_IRQ_NET)?;
 		// create TUN/TAP device
 		let uhyve_device = match &specs.nic {
 			Some(nic) => {
-				debug!("Intialize network interface");
+				debug!("Initialize network interface");
 				Some(UhyveNetwork::new(
 					evtfd,
 					nic.to_owned().to_string(),
@@ -245,20 +252,25 @@ impl Uhyve {
 			_ => None,
 		};
 
+		let dbg = specs
+			.gdbport
+			.map(|port| DebugManager::new(port).unwrap())
+			.map(|g| Arc::new(Mutex::new(g)));
+
 		let hyve = Uhyve {
-			vm: vm,
+			vm,
 			entry_point: 0,
-			mem: mem,
+			mem,
 			num_cpus: specs.num_cpus,
 			path: kernel_path,
 			boot_info: ptr::null(),
 			verbose: specs.verbose,
 			ip: ip_addr,
 			gateway: gw_addr,
-			mask: mask,
-			uhyve_device: uhyve_device,
-			virtio_device: virtio_device.clone(),
-			dbg: dbg.map(|g| Arc::new(Mutex::new(g))),
+			mask,
+			uhyve_device,
+			virtio_device,
+			dbg,
 		};
 
 		hyve.init_guest_mem();
@@ -300,23 +312,18 @@ impl Vm for Uhyve {
 		(self.mem.host_address() as *mut u8, self.mem.memory_size())
 	}
 
-	fn kernel_path(&self) -> &str {
-		&self.path
+	fn kernel_path(&self) -> PathBuf {
+		self.path.clone()
 	}
 
-	fn create_cpu(&self, id: u32) -> Result<Box<dyn VirtualCPU>> {
+	fn create_cpu(&self, id: u32) -> HypervisorResult<Box<dyn VirtualCPU>> {
 		let vm_start = self.mem.host_address() as usize;
-		let tx = match &self.uhyve_device {
-			Some(dev) => Some(dev.tx.clone()),
-			_ => None,
-		};
+		let tx = self.uhyve_device.as_ref().map(|dev| dev.tx.clone());
 
 		Ok(Box::new(UhyveCPU::new(
 			id,
 			self.path.clone(),
-			self.vm
-				.create_vcpu(id.try_into().unwrap())
-				.or_else(to_error)?,
+			self.vm.create_vcpu(id.try_into().unwrap())?,
 			vm_start,
 			tx,
 			self.virtio_device.clone(),
@@ -377,24 +384,20 @@ impl MmapMemory {
 		if mergeable {
 			debug!("Enable kernel feature to merge same pages");
 			unsafe {
-				if madvise(host_address, memory_size, MmapAdvise::MADV_MERGEABLE).is_err() {
-					panic!("madvise failed");
-				}
+				madvise(host_address, memory_size, MmapAdvise::MADV_MERGEABLE).unwrap();
 			}
 		}
 
 		if huge_pages {
 			debug!("Uhyve uses huge pages");
 			unsafe {
-				if madvise(host_address, memory_size, MmapAdvise::MADV_HUGEPAGE).is_err() {
-					panic!("madvise failed");
-				}
+				madvise(host_address, memory_size, MmapAdvise::MADV_HUGEPAGE).unwrap();
 			}
 		}
 
 		MmapMemory {
-			flags: flags,
-			memory_size: memory_size,
+			flags,
+			memory_size,
 			guest_address: guest_address as usize,
 			host_address: host_address as usize,
 		}
@@ -428,9 +431,7 @@ impl Drop for MmapMemory {
 	fn drop(&mut self) {
 		if self.memory_size() > 0 {
 			unsafe {
-				if munmap(self.host_address() as *mut c_void, self.memory_size()).is_err() {
-					panic!("munmap failed");
-				}
+				munmap(self.host_address() as *mut c_void, self.memory_size()).unwrap();
 			}
 		}
 	}

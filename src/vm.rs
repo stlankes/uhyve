@@ -1,28 +1,28 @@
 use super::paging::*;
-use elf;
-use elf::types::{ELFCLASS64, EM_X86_64, ET_EXEC, PT_LOAD, PT_TLS};
-use error::*;
-use libc;
-use memmap::Mmap;
-use nix::errno::errno;
+#[cfg(target_arch = "x86_64")]
+use core::arch::x86_64::_rdtsc as rdtsc;
+use goblin::elf;
+use goblin::elf64::header::{EM_X86_64, ET_DYN};
+use goblin::elf64::program_header::{PT_LOAD, PT_TLS};
+use goblin::elf64::reloc::*;
+use log::{debug, error, warn};
 use raw_cpuid::CpuId;
-use regex::Regex;
-use std;
-use std::fs::File;
-use std::io::Cursor;
-use std::io::Read;
+use std::convert::TryInto;
+use std::io::Write;
 use std::net::Ipv4Addr;
-use std::process::Command;
-use std::ptr::write_volatile;
-use std::time::SystemTime;
+use std::os::unix::ffi::OsStrExt;
+use std::path::PathBuf;
+use std::ptr::write;
+use std::time::{Duration, Instant, SystemTime};
 use std::{fmt, mem, slice};
+use std::{fs, io};
+use thiserror::Error;
 
-use consts::*;
-use debug_manager::DebugManager;
-#[cfg(target_os = "linux")]
-pub use linux::uhyve::*;
-#[cfg(target_os = "macos")]
-pub use macos::uhyve::*;
+use crate::consts::*;
+use crate::os::HypervisorError;
+
+const MHZ_TO_HZ: u64 = 1000000;
+const KHZ_TO_HZ: u64 = 1000;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -88,12 +88,21 @@ impl BootInfo {
 	}
 }
 
+impl Default for BootInfo {
+	fn default() -> Self {
+		Self::new()
+	}
+}
+
 impl fmt::Debug for BootInfo {
-	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		writeln!(f, "magic_number 0x{:x}", self.magic_number)?;
 		writeln!(f, "version 0x{:x}", self.version)?;
 		writeln!(f, "base 0x{:x}", self.base)?;
 		writeln!(f, "limit 0x{:x}", self.limit)?;
+		writeln!(f, "tls_start 0x{:x}", self.tls_start)?;
+		writeln!(f, "tls_filesz 0x{:x}", self.tls_filesz)?;
+		writeln!(f, "tls_memsz 0x{:x}", self.tls_memsz)?;
 		writeln!(f, "image_size 0x{:x}", self.image_size)?;
 		writeln!(
 			f,
@@ -122,7 +131,7 @@ impl fmt::Debug for BootInfo {
 }
 
 #[derive(Debug, Copy, Clone)]
-pub struct VmParameter<'a> {
+pub struct Parameter<'a> {
 	pub mem_size: usize,
 	pub num_cpus: u32,
 	pub verbose: bool,
@@ -133,34 +142,6 @@ pub struct VmParameter<'a> {
 	pub mask: Option<&'a str>,
 	pub nic: Option<&'a str>,
 	pub gdbport: Option<u32>,
-}
-
-impl<'a> VmParameter<'a> {
-	pub fn new(
-		mem_size: usize,
-		num_cpus: u32,
-		verbose: bool,
-		hugepage: bool,
-		mergeable: bool,
-		ip: Option<&'a str>,
-		gateway: Option<&'a str>,
-		mask: Option<&'a str>,
-		nic: Option<&'a str>,
-		gdbport: Option<u32>,
-	) -> Self {
-		VmParameter {
-			mem_size: mem_size,
-			num_cpus: num_cpus,
-			verbose: verbose,
-			hugepage: hugepage,
-			mergeable: mergeable,
-			ip: ip,
-			gateway: gateway,
-			mask: mask,
-			nic: nic,
-			gdbport: gdbport,
-		}
-	}
 }
 
 #[repr(C, packed)]
@@ -184,6 +165,7 @@ struct SysClose {
 	ret: i32,
 }
 
+#[repr(C, packed)]
 struct SysOpen {
 	name: *const u8,
 	flags: i32,
@@ -203,14 +185,17 @@ struct SysExit {
 	arg: i32,
 }
 
-const MAX_ARGC_ENVC: usize = 128;
+// FIXME: Do not use a fix number of arguments
+const MAX_ARGC: usize = 128;
+// FIXME: Do not use a fix number of environment variables
+const MAX_ENVC: usize = 128;
 
 #[repr(C, packed)]
 struct SysCmdsize {
 	argc: i32,
-	argsz: [i32; MAX_ARGC_ENVC],
+	argsz: [i32; MAX_ARGC],
 	envc: i32,
-	envsz: [i32; MAX_ARGC_ENVC],
+	envsz: [i32; MAX_ENVC],
 }
 
 #[repr(C, packed)]
@@ -225,15 +210,51 @@ struct SysUnlink {
 	ret: i32,
 }
 
-pub trait VirtualCPU {
-	fn init(&mut self, entry_point: u64) -> Result<()>;
-	fn run(&mut self) -> Result<()>;
-	fn print_registers(&self);
-	fn host_address(&self, addr: usize) -> usize;
-	fn virt_to_phys(&self, addr: usize) -> usize;
-	fn kernel_path(&self) -> String;
+pub type HypervisorResult<T> = Result<T, HypervisorError>;
 
-	fn cmdsize(&self, args_ptr: usize) -> Result<()> {
+#[derive(Error, Debug)]
+pub enum LoadKernelError {
+	#[error(transparent)]
+	Io(#[from] io::Error),
+	#[error(transparent)]
+	Goblin(#[from] goblin::error::Error),
+	#[error("guest memory size is not large enough")]
+	InsufficientMemory,
+}
+
+pub type LoadKernelResult<T> = Result<T, LoadKernelError>;
+
+/// Reasons for vCPU exits.
+pub enum VcpuStopReason {
+	/// The vCPU stopped for debugging.
+	Debug,
+	/// The vCPU exited with the specified exit code.
+	Exit(i32),
+}
+
+pub trait VirtualCPU {
+	/// Initialize the cpu to start running the code ad entry_point.
+	fn init(&mut self, entry_point: u64) -> HypervisorResult<()>;
+
+	/// Continues execution.
+	fn r#continue(&mut self) -> HypervisorResult<VcpuStopReason>;
+
+	/// Start the execution of the CPU. The function will run until it crashes (`Err`) or terminate with an exit code (`Ok`).
+	fn run(&mut self) -> HypervisorResult<i32>;
+
+	/// Prints the VCPU's registers to stdout.
+	fn print_registers(&self);
+
+	/// Translates an address from the VM's physical space into the hosts virtual space.
+	fn host_address(&self, addr: usize) -> usize;
+
+	/// Looks up the guests pagetable and translates a guest's virtual address to a guest's physical address.
+	fn virt_to_phys(&self, addr: usize) -> usize;
+
+	/// Returns the (host) path of the kernel binary.
+	fn kernel_path(&self) -> PathBuf;
+
+	fn cmdsize(&self, args_ptr: usize) {
 		let syssize = unsafe { &mut *(args_ptr as *mut SysCmdsize) };
 		syssize.argc = 0;
 		syssize.envc = 0;
@@ -242,14 +263,12 @@ pub trait VirtualCPU {
 		let mut separator_pos: i32 = 0;
 		let path = self.kernel_path();
 		let mut found_separator = false;
-		syssize.argsz[0] = path.len() as i32 + 1;
+		syssize.argsz[0] = path.as_os_str().len() as i32 + 1;
 
 		for argument in std::env::args() {
-			if !found_separator {
-				if argument == "--" {
-					separator_pos = counter + 1;
-					found_separator = true;
-				}
+			if !found_separator && argument == "--" {
+				separator_pos = counter + 1;
+				found_separator = true;
 			}
 
 			if found_separator && counter >= separator_pos {
@@ -258,6 +277,7 @@ pub trait VirtualCPU {
 
 			counter += 1;
 		}
+
 		if found_separator && counter >= separator_pos {
 			syssize.argc = counter - separator_pos + 1;
 		} else {
@@ -266,15 +286,20 @@ pub trait VirtualCPU {
 
 		counter = 0;
 		for (key, value) in std::env::vars() {
-			syssize.envsz[counter as usize] = (key.len() + value.len()) as i32 + 2;
-			counter += 1;
+			if counter < MAX_ENVC.try_into().unwrap() {
+				syssize.envsz[counter as usize] = (key.len() + value.len()) as i32 + 2;
+				counter += 1;
+			}
 		}
 		syssize.envc = counter;
 
-		Ok(())
+		if counter >= MAX_ENVC.try_into().unwrap() {
+			warn!("Environment is too large!");
+		}
 	}
 
-	fn cmdval(&self, args_ptr: usize) -> Result<()> {
+	/// Copies the arguments end environment of the application into the VM's memory.
+	fn cmdval(&self, args_ptr: usize) {
 		let syscmdval = unsafe { &*(args_ptr as *const SysCmdval) };
 
 		let mut counter: i32 = 0;
@@ -284,7 +309,7 @@ pub trait VirtualCPU {
 
 		// copy kernel path as first argument
 		{
-			let path = self.kernel_path();
+			let path = self.kernel_path().into_os_string();
 
 			let argvptr = unsafe { self.host_address(*(argv as *mut *mut u8) as usize) };
 			let len = path.len();
@@ -295,12 +320,11 @@ pub trait VirtualCPU {
 			slice[len] = 0;
 		}
 
+		// Copy the application arguments into the vm memory
 		for argument in std::env::args() {
-			if !found_separator {
-				if argument == "--" {
-					separator_pos = counter + 1;
-					found_separator = true;
-				}
+			if !found_separator && argument == "--" {
+				separator_pos = counter + 1;
+				found_separator = true;
 			}
 
 			if found_separator && counter >= separator_pos {
@@ -321,43 +345,47 @@ pub trait VirtualCPU {
 			counter += 1;
 		}
 
+		// Copy the environment variables into the vm memory
 		counter = 0;
 		let envp = self.host_address(syscmdval.envp as usize);
 		for (key, value) in std::env::vars() {
-			let envptr = unsafe {
-				self.host_address(
-					*((envp + counter as usize * mem::size_of::<usize>()) as *mut *mut u8) as usize,
-				)
-			};
-			let len = key.len() + value.len();
-			let slice = unsafe { slice::from_raw_parts_mut(envptr as *mut u8, len + 2) };
+			if counter < MAX_ENVC.try_into().unwrap() {
+				let envptr = unsafe {
+					self.host_address(
+						*((envp + counter as usize * mem::size_of::<usize>()) as *mut *mut u8)
+							as usize,
+					)
+				};
+				let len = key.len() + value.len();
+				let slice = unsafe { slice::from_raw_parts_mut(envptr as *mut u8, len + 2) };
 
-			// Create string for environment variable
-			slice[0..key.len()].copy_from_slice(key.as_bytes());
-			slice[key.len()..(key.len() + 1)].copy_from_slice(&"=".to_string().as_bytes());
-			slice[(key.len() + 1)..(len + 1)].copy_from_slice(value.as_bytes());
-			slice[len + 1] = 0;
-			counter += 1;
+				// Create string for environment variable
+				slice[0..key.len()].copy_from_slice(key.as_bytes());
+				slice[key.len()..(key.len() + 1)].copy_from_slice("=".to_string().as_bytes());
+				slice[(key.len() + 1)..(len + 1)].copy_from_slice(value.as_bytes());
+				slice[len + 1] = 0;
+				counter += 1;
+			}
 		}
-
-		Ok(())
 	}
 
-	fn unlink(&self, args_ptr: usize) -> Result<()> {
+	/// unlink delets a name from the filesystem. This is used to handle `unlink` syscalls from the guest.
+	/// TODO: UNSAFE AS *%@#. It has to be checked that the VM is allowed to unlink that file!
+	fn unlink(&self, args_ptr: usize) {
 		unsafe {
 			let sysunlink = &mut *(args_ptr as *mut SysUnlink);
 			sysunlink.ret = libc::unlink(self.host_address(sysunlink.name as usize) as *const i8);
 		}
-
-		Ok(())
 	}
 
-	fn exit(&self, args_ptr: usize) -> ! {
+	/// Reads the exit code from an VM and returns it
+	fn exit(&self, args_ptr: usize) -> i32 {
 		let sysexit = unsafe { &*(args_ptr as *const SysExit) };
-		std::process::exit(sysexit.arg);
+		sysexit.arg
 	}
 
-	fn open(&self, args_ptr: usize) -> Result<()> {
+	/// Handles an open syscall by opening a file on the host.
+	fn open(&self, args_ptr: usize) {
 		unsafe {
 			let sysopen = &mut *(args_ptr as *mut SysOpen);
 			sysopen.ret = libc::open(
@@ -366,20 +394,18 @@ pub trait VirtualCPU {
 				sysopen.mode,
 			);
 		}
-
-		Ok(())
 	}
 
-	fn close(&self, args_ptr: usize) -> Result<()> {
+	/// Handles an close syscall by closing the file on the host.
+	fn close(&self, args_ptr: usize) {
 		unsafe {
 			let sysclose = &mut *(args_ptr as *mut SysClose);
 			sysclose.ret = libc::close(sysclose.fd);
 		}
-
-		Ok(())
 	}
 
-	fn read(&self, args_ptr: usize) -> Result<()> {
+	/// Handles an read syscall on the host.
+	fn read(&self, args_ptr: usize) {
 		unsafe {
 			let sysread = &mut *(args_ptr as *mut SysRead);
 			let buffer = self.virt_to_phys(sysread.buf as usize);
@@ -395,11 +421,10 @@ pub trait VirtualCPU {
 				sysread.ret = -1;
 			}
 		}
-
-		Ok(())
 	}
 
-	fn write(&self, args_ptr: usize) -> Result<()> {
+	/// Handles an write syscall on the host.
+	fn write(&self, args_ptr: usize) -> io::Result<()> {
 		let syswrite = unsafe { &*(args_ptr as *const SysWrite) };
 		let mut bytes_written: usize = 0;
 		let buffer = self.virt_to_phys(syswrite.buf as usize);
@@ -414,7 +439,7 @@ pub trait VirtualCPU {
 				if step >= 0 {
 					bytes_written += step as usize;
 				} else {
-					return Err(Error::OsError(errno()));
+					return Err(io::Error::last_os_error());
 				}
 			}
 		}
@@ -422,67 +447,18 @@ pub trait VirtualCPU {
 		Ok(())
 	}
 
-	fn netinfo(&self, args_ptr: usize) -> Result<()> {
-		let mut mac: [u8; 6] = [0; 6];
-
-		match &(*crate::MAC_ADDRESS.lock().unwrap()) {
-			Some(mac_str) => {
-				let mut nth = 0;
-				for byte in mac_str.split(|c| c == ':' || c == '-') {
-					if nth == 6 {
-						return Err(Error::InvalidMacAddress);
-					}
-
-					mac[nth] = u8::from_str_radix(byte, 16).map_err(|_| Error::ParseIntError)?;
-
-					nth += 1;
-				}
-
-				if nth != 6 {
-					return Err(Error::InvalidMacAddress);
-				}
-			}
-			_ => {
-				let mut urandom = File::open("/dev/urandom").expect("Unable to open urandom");
-				urandom
-					.read_exact(&mut mac)
-					.expect("Unable to read random numbers");
-
-				mac[0] &= 0xfe; // creats a random MAC-address in the locally administered
-				mac[0] |= 0x02; // address range which can be used without conflict with other public devices
-			}
-		};
-
-		debug!(
-			"Create random MAC address {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-			mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
-		);
-
-		let netinfo_addr = unsafe { std::slice::from_raw_parts_mut(args_ptr as *mut u8, 6) };
-		netinfo_addr[0..].clone_from_slice(&mac);
-		*crate::MAC_ADDRESS.lock().unwrap() = Some(format!(
-			"{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-			mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
-		));
-
-		Ok(())
-	}
-
-	fn lseek(&self, args_ptr: usize) -> Result<()> {
+	/// Handles an write syscall on the host.
+	fn lseek(&self, args_ptr: usize) {
 		unsafe {
 			let syslseek = &mut *(args_ptr as *mut SysLseek);
 			syslseek.offset =
 				libc::lseek(syslseek.fd, syslseek.offset as i64, syslseek.whence) as isize;
 		}
-
-		Ok(())
 	}
 
-	fn uart(&self, message: String) -> Result<()> {
-		print!("{}", message);
-		//io::stdout().flush().ok().expect("Could not flush stdout");
-
-		Ok(())
+	/// Handles an UART syscall by writing to stdout.
+	fn uart(&self, buf: &[u8]) -> io::Result<()> {
+		io::stdout().write_all(buf)
 	}
 }
 
@@ -496,12 +472,15 @@ fn create_gdt_entry(flags: u64, base: u64, limit: u64) -> u64 {
 }
 
 pub trait Vm {
+	/// Returns the number of cores for the vm.
 	fn num_cpus(&self) -> u32;
+	/// Returns a pointer to the address of the guest memory and the size of the memory in bytes.
 	fn guest_mem(&self) -> (*mut u8, usize);
+	/// Sets the elf entry point.
 	fn set_entry_point(&mut self, entry: u64);
 	fn get_entry_point(&self) -> u64;
-	fn kernel_path(&self) -> &str;
-	fn create_cpu(&self, id: u32) -> Result<Box<dyn VirtualCPU>>;
+	fn kernel_path(&self) -> PathBuf;
+	fn create_cpu(&self, id: u32) -> HypervisorResult<Box<dyn VirtualCPU>>;
 	fn set_boot_info(&mut self, header: *const BootInfo);
 	fn cpu_online(&self) -> u32;
 	fn get_ip(&self) -> Option<Ipv4Addr>;
@@ -522,9 +501,8 @@ pub trait Vm {
 			let gdt_entry: u64 = mem_addr as u64 + BOOT_GDT;
 
 			// initialize GDT
-			*((gdt_entry + 0 * mem::size_of::<*mut u64>() as u64) as *mut u64) =
-				create_gdt_entry(0, 0, 0);
-			*((gdt_entry + 1 * mem::size_of::<*mut u64>() as u64) as *mut u64) =
+			*((gdt_entry) as *mut u64) = create_gdt_entry(0, 0, 0);
+			*((gdt_entry + mem::size_of::<*mut u64>() as u64) as *mut u64) =
 				create_gdt_entry(0xA09B, 0, 0xFFFFF); /* code */
 			*((gdt_entry + 2 * mem::size_of::<*mut u64>() as u64) as *mut u64) =
 				create_gdt_entry(0xC093, 0, 0xFFFFF); /* data */
@@ -561,150 +539,180 @@ pub trait Vm {
 		}
 	}
 
-	unsafe fn load_kernel(&mut self) -> Result<()> {
-		debug!("Load kernel from {}", self.kernel_path());
+	unsafe fn load_kernel(&mut self) -> LoadKernelResult<()> {
+		debug!("Load kernel from {}", self.kernel_path().display());
 
-		// open the file in read only
-		let kernel_file = File::open(self.kernel_path())
-			.map_err(|_| Error::InvalidFile(self.kernel_path().into()))?;
-		let file =
-			Mmap::map(&kernel_file).map_err(|_| Error::InvalidFile(self.kernel_path().into()))?;
+		let buffer = fs::read(self.kernel_path())?;
+		let elf = elf::Elf::parse(&buffer)?;
 
-		// parse the header with ELF module
-		let file_elf = {
-			let mut data = Cursor::new(file.as_ref());
-
-			elf::File::open_stream(&mut data)
-				.map_err(|_| Error::InvalidFile(self.kernel_path().into()))
-		}?;
-
-		if file_elf.ehdr.class != ELFCLASS64
-			|| file_elf.ehdr.elftype != ET_EXEC
-			|| file_elf.ehdr.machine != EM_X86_64
-		{
-			return Err(Error::InvalidFile(self.kernel_path().into()));
+		if !elf.libraries.is_empty() {
+			warn!(
+				"Error: file depends on following libraries: {:?}",
+				elf.libraries
+			);
+			return Err(LoadKernelError::Io(io::ErrorKind::InvalidData.into()));
 		}
 
-		// acquire the slices of the user memory and kernel file
+		let is_dyn = elf.header.e_type == ET_DYN;
+		debug!("ELF file is a shared object file: {}", is_dyn);
+
+		if elf.header.e_machine != EM_X86_64 {
+			return Err(LoadKernelError::Io(io::ErrorKind::InvalidData.into()));
+		}
+
+		// acquire the slices of the user memory
 		let (vm_mem, vm_mem_length) = self.guest_mem();
-		let kernel_file = file.as_ref();
 
 		// create default bootinfo
+		#[allow(clippy::cast_ptr_alignment)]
 		let boot_info = vm_mem.offset(BOOT_INFO_ADDR as isize) as *mut BootInfo;
 		*boot_info = BootInfo::new();
 
 		// forward IP address to kernel
-		match self.get_ip() {
-			Some(ip) => {
-				write_volatile(&mut (*boot_info).hcip, ip.octets());
-			}
-			_ => {}
+		if let Some(ip) = self.get_ip() {
+			write(&mut (*boot_info).hcip, ip.octets());
 		}
 
 		// forward gateway address to kernel
-		match self.get_gateway() {
-			Some(gateway) => {
-				write_volatile(&mut (*boot_info).hcgateway, gateway.octets());
-			}
-			_ => {}
+		if let Some(gateway) = self.get_gateway() {
+			write(&mut (*boot_info).hcgateway, gateway.octets());
 		}
 
 		// forward mask to kernel
-		match self.get_mask() {
-			Some(mask) => {
-				write_volatile(&mut (*boot_info).hcmask, mask.octets());
-			}
-			_ => {}
+		if let Some(mask) = self.get_mask() {
+			write(&mut (*boot_info).hcmask, mask.octets());
 		}
 
-		let mut pstart: Option<u64> = None;
+		let (start_address, elf_entry) = if is_dyn {
+			// TODO: should be a random start address, if we have a relocatable executable
+			(0x400000u64, 0x400000u64 + elf.entry)
+		} else {
+			// default location of a non-relocatable binary
+			(0x800000u64, elf.entry)
+		};
 
-		for header in file_elf.phdrs {
-			if header.progtype == PT_TLS {
-				write_volatile(&mut (*boot_info).tls_start, header.paddr);
-				write_volatile(&mut (*boot_info).tls_filesz, header.filesz);
-				write_volatile(&mut (*boot_info).tls_memsz, header.memsz);
-			} else if header.progtype == PT_LOAD {
-				let vm_start = header.paddr as usize;
-				let vm_end = vm_start + header.filesz as usize;
+		self.set_entry_point(elf_entry);
+		debug!("ELF entry point at 0x{:x}", elf_entry);
 
-				let kernel_start = header.offset as usize;
-				let kernel_end = kernel_start + header.filesz as usize;
+		debug!("Set HermitCore header at 0x{:x}", BOOT_INFO_ADDR as usize);
+		self.set_boot_info(boot_info);
 
-				debug!(
-					"Load segment with start addr 0x{:x} and size 0x{:x}, offset 0x{:x}",
-					header.paddr, header.filesz, header.offset
-				);
+		write(&mut (*boot_info).base, start_address);
+		write(&mut (*boot_info).limit, vm_mem_length as u64); // memory size
+		write(&mut (*boot_info).possible_cpus, 1);
+		#[cfg(target_os = "linux")]
+		write(&mut (*boot_info).uhyve, 0x3); // announce uhyve and pci support
+		#[cfg(not(target_os = "linux"))]
+		write(&mut (*boot_info).uhyve, 0x1); // announce uhyve
+		write(&mut (*boot_info).current_boot_id, 0);
+		if self.verbose() {
+			write(&mut (*boot_info).uartport, UHYVE_UART_PORT);
+		} else {
+			write(&mut (*boot_info).uartport, 0);
+		}
 
-				let vm_slice = std::slice::from_raw_parts_mut(vm_mem, vm_mem_length);
-				vm_slice[vm_start..vm_end].copy_from_slice(&kernel_file[kernel_start..kernel_end]);
-				for i in &mut vm_slice[vm_end..vm_end + (header.memsz - header.filesz) as usize] {
-					*i = 0
-				}
+		debug!(
+			"Set stack base to 0x{:x}",
+			start_address - KERNEL_STACK_SIZE
+		);
+		write(
+			&mut (*boot_info).current_stack_address,
+			start_address - KERNEL_STACK_SIZE,
+		);
 
-				if pstart.is_none() {
-					self.set_entry_point(file_elf.ehdr.entry);
-					debug!("ELF entry point at 0x{:x}", file_elf.ehdr.entry);
+		write(&mut (*boot_info).host_logical_addr, vm_mem.offset(0) as u64);
 
-					pstart = Some(header.paddr as u64);
+		let n = SystemTime::now()
+			.duration_since(SystemTime::UNIX_EPOCH)
+			.expect("SystemTime before UNIX EPOCH!");
+		write(&mut (*boot_info).boot_gtod, n.as_secs() * 1000000);
 
-					debug!("Set HermitCore header at 0x{:x}", BOOT_INFO_ADDR as usize);
-					self.set_boot_info(boot_info);
+		let cpuid = CpuId::new();
+		let mhz: u32 = detect_freq_from_cpuid(&cpuid).unwrap_or_else(|_| {
+			debug!("Failed to detect from cpuid");
+			detect_freq_from_cpuid_hypervisor_info(&cpuid).unwrap_or_else(|_| {
+				debug!("Failed to detect from hypervisor_info");
+				get_cpu_frequency_from_os().unwrap_or(0)
+			})
+		});
+		debug!("detected a cpu frequency of {} Mhz", mhz);
+		write(&mut (*boot_info).cpu_freq, mhz);
+		if (*boot_info).cpu_freq == 0 {
+			warn!("Unable to determine processor frequency");
+		}
 
-					write_volatile(&mut (*boot_info).base, header.paddr);
-					write_volatile(&mut (*boot_info).limit, vm_mem_length as u64); // memory size
-					write_volatile(&mut (*boot_info).possible_cpus, 1);
-					#[cfg(target_os = "linux")]
-					write_volatile(&mut (*boot_info).uhyve, 0x3); // announce uhyve and pci support
-					#[cfg(not(target_os = "linux"))]
-					write_volatile(&mut (*boot_info).uhyve, 0x1); // announce uhyve
-					write_volatile(&mut (*boot_info).current_boot_id, 0);
-					if self.verbose() {
-						write_volatile(&mut (*boot_info).uartport, UHYVE_UART_PORT);
+		// load kernel and determine image size
+		let vm_slice = std::slice::from_raw_parts_mut(vm_mem, vm_mem_length);
+		let mut image_size = 0;
+		elf.program_headers
+			.iter()
+			.try_for_each(|program_header| match program_header.p_type {
+				PT_LOAD => {
+					let region_start = if is_dyn {
+						(start_address + program_header.p_vaddr) as usize
 					} else {
-						write_volatile(&mut (*boot_info).uartport, 0);
-					}
+						program_header.p_vaddr as usize
+					};
+					let region_end = region_start + program_header.p_filesz as usize;
+					let kernel_start = program_header.p_offset as usize;
+					let kernel_end = kernel_start + program_header.p_filesz as usize;
 
-					debug!("Set stack base to 0x{:x}", header.paddr - KERNEL_STACK_SIZE);
-					write_volatile(
-						&mut (*boot_info).current_stack_address,
-						header.paddr - KERNEL_STACK_SIZE,
+					debug!(
+						"Load segment with start addr 0x{:x} and size 0x{:x}, offset 0x{:x}",
+						program_header.p_vaddr, program_header.p_filesz, program_header.p_offset
 					);
 
-					write_volatile(&mut (*boot_info).host_logical_addr, vm_mem.offset(0) as u64);
-
-					match SystemTime::now().duration_since(SystemTime::UNIX_EPOCH) {
-						Ok(n) => write_volatile(&mut (*boot_info).boot_gtod, n.as_secs() * 1000000),
-						Err(_) => panic!("SystemTime before UNIX EPOCH!"),
+					if region_start + program_header.p_memsz as usize > vm_mem_length {
+						return Err(LoadKernelError::InsufficientMemory);
 					}
 
-					let cpuid = CpuId::new();
-					let mhz: u32 = detect_freq_from_cpuid(&cpuid).unwrap_or_else(|_| {
-						debug!("Failed to detect from cpuid");
-						detect_freq_from_cpuid_hypervisor_info(&cpuid).unwrap_or_else(|_| {
-							debug!("Failed to detect from hypervisor_info");
-							detect_freq_from_cpu_brand_string(&cpuid).unwrap_or_else(|_| {
-								debug!("Failed to detect from brand string");
-								get_cpu_frequency_from_os().unwrap_or(0)
-							})
-						})
-					});
-					debug!("detected a cpu frequency of {} Mhz", mhz);
-					write_volatile(&mut (*boot_info).cpu_freq, mhz);
-					if (*boot_info).cpu_freq == 0 {
-						warn!("Unable to determine processor frequency");
+					vm_slice[region_start..region_end]
+						.copy_from_slice(&buffer[kernel_start..kernel_end]);
+					for i in &mut vm_slice[region_end
+						..region_end + (program_header.p_memsz - program_header.p_filesz) as usize]
+					{
+						*i = 0
 					}
+
+					image_size = if is_dyn {
+						program_header.p_vaddr + program_header.p_memsz
+					} else {
+						image_size + program_header.p_memsz
+					};
+					write(&mut (*boot_info).image_size, image_size);
+
+					Ok(())
 				}
+				PT_TLS => {
+					// determine TLS section
+					debug!("Found TLS section with size {}", program_header.p_memsz);
+					let tls_start = if is_dyn {
+						start_address + program_header.p_vaddr
+					} else {
+						program_header.p_vaddr
+					};
 
-				// store total kernel size
-				let start = pstart.unwrap();
-				write_volatile(
-					&mut (*boot_info).image_size,
-					header.paddr + header.memsz - start,
-				);
-				//debug!("Kernel header: {:?}", *boot_info);
+					write(&mut (*boot_info).tls_start, tls_start);
+					write(&mut (*boot_info).tls_filesz, program_header.p_filesz);
+					write(&mut (*boot_info).tls_memsz, program_header.p_memsz);
+
+					Ok(())
+				}
+				_ => Ok(()),
+			})?;
+
+		// relocate entries (strings, copy-data, etc.) with an addend
+		elf.dynrelas.iter().for_each(|rela| match rela.r_type {
+			R_X86_64_RELATIVE => {
+				let offset = (vm_mem as u64 + start_address + rela.r_offset) as *mut u64;
+				*offset = (start_address as i64 + rela.r_addend.unwrap_or(0)) as u64;
 			}
-		}
+			_ => {
+				debug!("Unsupported relocation type {}", rela.r_type);
+			}
+		});
+
+		// debug!("Boot header: {:?}", *boot_info);
 
 		debug!("Kernel loaded");
 
@@ -712,26 +720,55 @@ pub trait Vm {
 	}
 }
 
-fn detect_freq_from_cpuid(cpuid: &CpuId) -> std::result::Result<u32, ()> {
-	let freq_info = cpuid.get_processor_frequency_info().ok_or(())?;
-	let mhz = freq_info.processor_base_frequency() as u32;
-	if mhz > 0 {
-		Ok(mhz)
+fn detect_freq_from_cpuid(cpuid: &CpuId) -> Result<u32, ()> {
+	debug!("Trying to detect CPU frequency by tsc info");
+
+	let has_invariant_tsc = cpuid
+		.get_advanced_power_mgmt_info()
+		.map_or(false, |apm_info| apm_info.has_invariant_tsc());
+	if !has_invariant_tsc {
+		warn!("TSC frequency varies with speed-stepping")
+	}
+
+	let tsc_frequency_hz = cpuid.get_tsc_info().map(|tinfo| {
+		if tinfo.tsc_frequency().is_some() {
+			tinfo.tsc_frequency()
+		} else {
+			// Skylake and Kabylake don't report the crystal clock, approximate with base frequency:
+			cpuid
+				.get_processor_frequency_info()
+				.map(|pinfo| pinfo.processor_base_frequency() as u64 * MHZ_TO_HZ)
+				.map(|cpu_base_freq_hz| {
+					let crystal_hz =
+						cpu_base_freq_hz * tinfo.denominator() as u64 / tinfo.numerator() as u64;
+					crystal_hz * tinfo.numerator() as u64 / tinfo.denominator() as u64
+				})
+		}
+	});
+
+	let hz = match tsc_frequency_hz {
+		Some(x) => x.unwrap_or(0),
+		None => {
+			return Err(());
+		}
+	};
+
+	if hz > 0 {
+		Ok((hz / MHZ_TO_HZ).try_into().unwrap())
 	} else {
 		Err(())
 	}
 }
 
-fn detect_freq_from_cpuid_hypervisor_info(cpuid: &CpuId) -> std::result::Result<u32, ()> {
-	debug!("Trying to detect CPU frequency via cpuid hypervisor info");
+fn detect_freq_from_cpuid_hypervisor_info(cpuid: &CpuId) -> Result<u32, ()> {
+	debug!("Trying to detect CPU frequency by hypervisor info");
 	let hypervisor_info = cpuid.get_hypervisor_info().ok_or(())?;
 	debug!(
 		"cpuid detected hypervisor: {:?}",
 		hypervisor_info.identify()
 	);
-	let freq = hypervisor_info.tsc_frequency().ok_or(())?;
-	debug!("cpuid detected frequency of {} Hz from hypervisor", freq);
-	let mhz: u32 = freq / 1000000u32;
+	let hz = hypervisor_info.tsc_frequency().ok_or(())? as u64 * KHZ_TO_HZ;
+	let mhz: u32 = (hz / MHZ_TO_HZ).try_into().unwrap();
 	if mhz > 0 {
 		Ok(mhz)
 	} else {
@@ -739,78 +776,101 @@ fn detect_freq_from_cpuid_hypervisor_info(cpuid: &CpuId) -> std::result::Result<
 	}
 }
 
-fn detect_freq_from_cpu_brand_string(cpuid: &CpuId) -> std::result::Result<u32, ()> {
-	let extended_function_info = cpuid.get_extended_function_info().ok_or(())?;
-	let brand_string = extended_function_info.processor_brand_string().ok_or(())?;
-
-	let ghz_find = brand_string.find("GHz").ok_or(())?;
-	let index = ghz_find - 4;
-	let thousand_char = brand_string.chars().nth(index).unwrap();
-	let decimal_char = brand_string.chars().nth(index + 1).unwrap();
-	let hundred_char = brand_string.chars().nth(index + 2).unwrap();
-	let ten_char = brand_string.chars().nth(index + 3).unwrap();
-
-	if let (Some(thousand), '.', Some(hundred), Some(ten)) = (
-		thousand_char.to_digit(10),
-		decimal_char,
-		hundred_char.to_digit(10),
-		ten_char.to_digit(10),
-	) {
-		Ok((thousand * 1000 + hundred * 100 + ten * 10) as u32)
+fn get_cpu_frequency_from_os() -> Result<u32, ()> {
+	// Determine TSC frequency by measuring it (loop for a second, record ticks)
+	let duration = Duration::from_millis(10);
+	let now = Instant::now();
+	let start = unsafe { rdtsc() };
+	if start > 0 {
+		loop {
+			if now.elapsed() >= duration {
+				break;
+			}
+		}
+		let end = unsafe { rdtsc() };
+		Ok((((end - start) * 100) / MHZ_TO_HZ).try_into().unwrap())
 	} else {
 		Err(())
 	}
-}
-
-#[cfg(target_os = "linux")]
-fn get_cpu_frequency_from_os() -> std::result::Result<u32, ()> {
-	let res_output = Command::new("lscpu").output();
-	if res_output.is_err() {
-		return Err(());
-	}
-	let output = res_output.unwrap();
-	if !output.status.success() {
-		return Err(());
-	}
-	let lscpu_res = std::string::String::from_utf8(output.stdout);
-	let regex_res = Regex::new(r"(?im:^CPU MHz:\s+(?P<frequency>\d+))");
-	if lscpu_res.is_err() || regex_res.is_err() {
-		return Err(());
-	}
-	let lscpu_str = lscpu_res.unwrap();
-	let re = regex_res.unwrap();
-	let freq_str_opt = re
-		.captures(&lscpu_str)
-		.and_then(|cap| cap.name("frequency"));
-	match freq_str_opt {
-		Some(freq_match) => {
-			let freq_res = freq_match.as_str().parse::<u32>();
-			if freq_res.is_err() {
-				return Err(());
-			}
-			let freq = freq_res.unwrap();
-			// Sanity check - ToDo: Use a named constant for upper limit of frequency
-			if freq > 0 && freq < 10000 {
-				Ok(freq)
-			} else {
-				Err(())
-			}
-		}
-		None => Err(()),
-	}
-}
-
-#[cfg(not(target_os = "linux"))]
-fn get_cpu_frequency_from_os() -> std::result::Result<u32, ()> {
-	//Not implemented yet for other systems
-	Err(())
 }
 
 #[cfg(test)]
 mod tests {
 	use super::*;
 
-	#[cfg(target_os = "linux")]
+	// test is derived from
+	// https://github.com/gz/rust-cpuid/blob/master/examples/tsc_frequency.rs
+	#[test]
+	fn test_detect_freq_from_cpuid() {
+		let cpuid = CpuId::new();
+		let has_tsc = cpuid
+			.get_feature_info()
+			.map_or(false, |finfo| finfo.has_tsc());
+
+		let has_invariant_tsc = cpuid
+			.get_advanced_power_mgmt_info()
+			.map_or(false, |apm_info| apm_info.has_invariant_tsc());
+
+		let tsc_frequency_hz = cpuid.get_tsc_info().map(|tinfo| {
+			if tinfo.tsc_frequency().is_some() {
+				tinfo.tsc_frequency()
+			} else {
+				// Skylake and Kabylake don't report the crystal clock, approximate with base frequency:
+				cpuid
+					.get_processor_frequency_info()
+					.map(|pinfo| pinfo.processor_base_frequency() as u64 * MHZ_TO_HZ)
+					.map(|cpu_base_freq_hz| {
+						let crystal_hz = cpu_base_freq_hz * tinfo.denominator() as u64
+							/ tinfo.numerator() as u64;
+						crystal_hz * tinfo.numerator() as u64 / tinfo.denominator() as u64
+					})
+			}
+		});
+
+		assert!(has_tsc, "System does not have a TSC.");
+
+		// Try to figure out TSC frequency with CPUID
+		println!(
+			"TSC Frequency is: {} ({})",
+			match tsc_frequency_hz {
+				Some(x) => format!("{} Hz", x.unwrap_or(0)),
+				None => String::from("unknown"),
+			},
+			if has_invariant_tsc {
+				"invariant"
+			} else {
+				"TSC frequency varies with speed-stepping"
+			}
+		);
+
+		// Check if we run in a VM and the hypervisor can give us the TSC frequency
+		cpuid.get_hypervisor_info().map(|hv| {
+			hv.tsc_frequency().map(|tsc_khz| {
+				let virtual_tsc_frequency_hz = tsc_khz as u64 * KHZ_TO_HZ;
+				println!(
+					"Hypervisor reports TSC Frequency at: {} Hz",
+					virtual_tsc_frequency_hz
+				);
+			})
+		});
+
+		// Determine TSC frequency by measuring it (loop for a second, record ticks)
+		let one_second = Duration::from_secs(1);
+		let now = Instant::now();
+		let start = unsafe { rdtsc() };
+		assert!(start > 0, "Don't have rdtsc on stable!");
+		loop {
+			if now.elapsed() >= one_second {
+				break;
+			}
+		}
+		let end = unsafe { rdtsc() };
+		println!(
+			"Empirical measurement of TSC frequency was: {} Hz",
+			(end - start)
+		);
+	}
+
 	#[test]
 	fn test_get_cpu_frequency_from_os() {
 		let freq_res = get_cpu_frequency_from_os();
@@ -819,21 +879,57 @@ mod tests {
 		assert!(freq > 0);
 		assert!(freq < 10000); //More than 10Ghz is probably wrong
 	}
-}
 
-#[cfg(not(target_os = "windows"))]
-pub fn create_vm(path: String, specs: &super::vm::VmParameter) -> Result<Uhyve> {
-	// If we are given a port, create new DebugManager.
-	let gdb = specs.gdbport.map(|port| DebugManager::new(port).unwrap());
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn test_vm_load_min_size_1024() {
+		let mut path = PathBuf::new();
+		path.push(env!("CARGO_MANIFEST_DIR"));
+		path.push("/benches_data/hello_world");
+		let vm = crate::Uhyve::new(
+			path,
+			&Parameter {
+				mem_size: 1024,
+				num_cpus: 1,
+				verbose: false,
+				hugepage: true,
+				mergeable: false,
+				ip: None,
+				gateway: None,
+				mask: None,
+				nic: None,
+				gdbport: None,
+			},
+		);
+		assert!(vm.is_err());
+	}
 
-	let vm = Uhyve::new(path.clone(), &specs, gdb)?;
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn test_vm_load_min_size_102400() {
+		let mut path = PathBuf::new();
+		path.push(env!("CARGO_MANIFEST_DIR"));
+		path.push("/benches_data/hello_world");
+		let mut vm = crate::Uhyve::new(
+			path,
+			&Parameter {
+				mem_size: 102400,
+				num_cpus: 1,
+				verbose: false,
+				hugepage: true,
+				mergeable: false,
+				ip: None,
+				gateway: None,
+				mask: None,
+				nic: None,
+				gdbport: None,
+			},
+		)
+		.expect("Unable to create VM");
+		unsafe {
+			let res = vm.load_kernel();
 
-	Ok(vm)
-}
-
-#[cfg(target_os = "windows")]
-pub fn create_vm(path: String, specs: &super::vm::VmParameter) -> Result<Uhyve> {
-	let vm = Uhyve::new(path.clone(), &specs)?;
-
-	Ok(vm)
+			assert!(res.is_err());
+		}
+	}
 }

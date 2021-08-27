@@ -1,9 +1,7 @@
 # uhyve - A minimal hypervisor for RustyHermit
 
 [![crates.io](https://img.shields.io/crates/v/uhyve.svg)](https://crates.io/crates/uhyve)
-![Actions Status](https://github.com/hermitcore/uhyve/workflows/Build/badge.svg)
-[![Build Status](https://travis-ci.com/hermitcore/uhyve.svg?branch=master)](https://travis-ci.com/hermitcore/uhyve)
-[![Slack Status](https://radiant-ridge-95061.herokuapp.com/badge.svg)](https://radiant-ridge-95061.herokuapp.com)
+[![Slack Status](https://matrix.osbyexample.com:3008/badge.svg)](https://matrix.osbyexample.com:3008)
 
 ## Introduction
 
@@ -36,6 +34,8 @@ If the following command gives you some output, you are ready to go!
 lsmod | grep kvm
 ```
 
+**NOTE:** If in case the above steps don't work, make sure to check in your BIOS settings that virtualization is enabled there.
+
 ### macOS
 
 **Disclaimer:** Currently, uhyve is mainly developed for Linux.
@@ -57,15 +57,40 @@ sysctl kern.hv_support
 
 The output `kern.hv_support: 1` indicates virtualization support.
 
+Starting with Big Sur, all processes using the Hypervisor API must have the [com.apple.security.hypervisor](https://developer.apple.com/documentation/Hypervisor) entitlement and therefore must be signed.
+
 ## Building from source
 
-To build from souce, simply checkout the code and use `cargo build`.
+To build from source, simply checkout the code and use `cargo build`.
 
 ```sh
 git clone https://github.com/hermitcore/uhyve.git
 cd uhyve
 cargo build --release
 ```
+
+## Signing uhyve to run on macOS Big Sur
+
+`uhyve` can be self-signed with the following command.
+
+```sh
+codesign -s - --entitlements app.entitlements --force path_to_uhyve/uhyve
+```
+
+The file `app.entitlements` must have following content:
+
+```sh
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>com.apple.security.hypervisor</key>
+    <true/>
+</dict>
+</plist>
+```
+
+For further details have a look at [Apple's documentation](https://developer.apple.com/documentation/bundleresources/entitlements/com_apple_security_hypervisor).
 
 ## Running RustyHermit apps within uhyve
 
@@ -107,6 +132,10 @@ In principle, every gdb-capable IDE should be able to debug RustyHermit applicat
 The repository [rusty-hermit](https://github.com/hermitcore/rusty-hermit) provides [example configuration files](https://github.com/hermitcore/rusty-hermit/tree/master/.vscode) to debug a RustyHermit application with Visual Code.
 
 ![Debugging RustyHermit apps](img/vs_code.png)
+
+## Known issues
+
+ * Uhyve isn't able to pass more than 128 environment variables to the unikernel.
 
 ## Licensing
 

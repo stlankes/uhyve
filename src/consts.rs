@@ -1,4 +1,3 @@
-pub const DEFAULT_GUEST_SIZE: usize = 64 * 1024 * 1024;
 pub const PAGE_SIZE: usize = 0x1000;
 pub const GDT_KERNEL_CODE: u16 = 1;
 pub const GDT_KERNEL_DATA: u16 = 2;
@@ -12,7 +11,7 @@ pub const BOOT_PML4: u64 = 0x10000;
 pub const BOOT_PDPTE: u64 = 0x11000;
 pub const BOOT_PDE: u64 = 0x12000;
 pub const BOOT_INFO_ADDR: u64 = 0x9000;
-pub const EFER_SCE: u64 = 1 << 0; /* System Call Extensions */
+pub const EFER_SCE: u64 = 1; /* System Call Extensions */
 pub const EFER_LME: u64 = 1 << 8; /* Long mode enable */
 pub const EFER_LMA: u64 = 1 << 10; /* Long mode active (read-only) */
 pub const EFER_NXE: u64 = 1 << 11; /* PTE No-Execute bit enable */
@@ -35,7 +34,6 @@ pub const UHYVE_PORT_EXIT: u16 = 0x540;
 pub const UHYVE_PORT_LSEEK: u16 = 0x580;
 
 // Networkports
-pub const UHYVE_PORT_NETINFO: u16 = 0x600;
 pub const UHYVE_PORT_NETWRITE: u16 = 0x640;
 pub const UHYVE_PORT_NETREAD: u16 = 0x680;
 pub const UHYVE_PORT_NETSTAT: u16 = 0x700;

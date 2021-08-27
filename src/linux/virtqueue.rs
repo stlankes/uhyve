@@ -1,4 +1,4 @@
-use consts::PAGE_SIZE;
+use crate::consts::PAGE_SIZE;
 use std::marker::PhantomData;
 use std::mem;
 use std::mem::size_of;
@@ -27,22 +27,29 @@ impl<T> Vring<T> {
 	}
 
 	pub fn _flags(&self) -> u16 {
-		unsafe { *(self.mem as *const u16) }
+		unsafe {
+			#[allow(clippy::cast_ptr_alignment)]
+			*(self.mem as *const u16)
+		}
 	}
 
 	pub fn index(&self) -> u16 {
-		unsafe { *(self.mem.offset(2) as *const u16) }
+		unsafe {
+			#[allow(clippy::cast_ptr_alignment)]
+			*(self.mem.offset(2) as *const u16)
+		}
 	}
 
 	pub fn advance_index(&mut self) {
 		unsafe {
 			let new_value = self.index() + 1;
+			#[allow(clippy::cast_ptr_alignment)]
 			let write_ptr = self.mem.offset(2) as *mut u16;
 			*write_ptr = new_value;
 		}
 	}
 
-	pub fn ring_elem(&self, index: u16) -> &mut T {
+	pub fn ring_elem(&mut self, index: u16) -> &mut T {
 		let elem_size = mem::size_of::<T>() as u16;
 		unsafe { &mut *(self.mem.offset((4 + index * elem_size) as isize) as *mut T) }
 	}
@@ -102,29 +109,28 @@ fn get_used_ring_offset() -> usize {
 }
 
 impl Virtqueue {
-	pub fn new(mem: *mut u8, queue_size: usize) -> Self {
-		unsafe {
-			let descriptor_table = mem as *mut VringDescriptor;
-			let available_ring_ptr = mem.offset(get_available_ring_offset() as isize);
-			let used_ring_ptr = mem.offset(get_used_ring_offset() as isize);
-			let available_ring = VringAvailable::new(available_ring_ptr);
-			let used_ring = VringUsed::new(used_ring_ptr);
-			Virtqueue {
-				descriptor_table,
-				available_ring,
-				used_ring,
-				last_seen_available: 0,
-				last_seen_used: 0,
-				queue_size: queue_size as u16,
-			}
+	pub unsafe fn new(mem: *mut u8, queue_size: usize) -> Self {
+		#[allow(clippy::cast_ptr_alignment)]
+		let descriptor_table = mem as *mut VringDescriptor;
+		let available_ring_ptr = mem.add(get_available_ring_offset());
+		let used_ring_ptr = mem.add(get_used_ring_offset());
+		let available_ring = VringAvailable::new(available_ring_ptr);
+		let used_ring = VringUsed::new(used_ring_ptr);
+		Virtqueue {
+			descriptor_table,
+			available_ring,
+			used_ring,
+			last_seen_available: 0,
+			last_seen_used: 0,
+			queue_size: queue_size as u16,
 		}
 	}
 
-	pub unsafe fn get_descriptor(&self, index: u16) -> &mut VringDescriptor {
+	pub unsafe fn get_descriptor(&mut self, index: u16) -> &mut VringDescriptor {
 		&mut *self.descriptor_table.offset(index as isize)
 	}
 
-	pub fn avail_iter(&mut self) -> AvailIter {
+	pub fn avail_iter(&mut self) -> AvailIter<'_> {
 		AvailIter {
 			available_ring: &self.available_ring,
 			last_seen_available: &mut self.last_seen_available,

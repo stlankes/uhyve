@@ -1,18 +1,18 @@
-name: Test
+name: Build and test
 
 on:
+  pull_request:
   push:
     branches:
       - master
-  pull_request:
-    branches:
-      - master
+      - staging
+      - trying
   schedule:
     - cron: '0 0 * * 6'
 
 jobs:
-  build:
-
+  test:
+    name: Cargo tests
     runs-on: ${{ matrix.os }}
 
     strategy:
@@ -31,16 +31,86 @@ jobs:
 
 
     steps:
-    - uses: hecrj/setup-rust-action@v1.3.2
+    - uses: hecrj/setup-rust-action@v1
       with: 
          rust-version: ${{ matrix.rust }}
          components: ${{ matrix.components || '' }}
          targets: ${{ matrix.targets || '' }}
-    - uses: actions/checkout@v1
+    - uses: actions/checkout@v2.3.4
+      with:
+         submodules: true
+         fetch-depth: '0'
+    - name: Check Cargo availability
+      run: cargo --version
+    - name: Test
+      run: |
+         cargo test --lib -- --nocapture --skip test_vm
+         cargo test --doc -- --nocapture
+
+  build:
+    name: Build
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      matrix:
+        os: [ubuntu-latest,macOS-latest]
+        rust: [nightly]
+        include:
+          - os: macOS-latest
+            rust: 'nightly'
+            components: 'rustfmt, clippy, rust-src'
+            targets: 'x86_64-apple-darwin'
+          - os: ubuntu-latest
+            rust: 'nightly'
+            components: 'rustfmt, clippy'
+            targets: 'x86_64-unknown-linux-musl'
+
+
+    steps:
+    - uses: hecrj/setup-rust-action@v1
+      with:
+         rust-version: ${{ matrix.rust }}
+         components: ${{ matrix.components || '' }}
+         targets: ${{ matrix.targets || '' }}
+    - uses: actions/checkout@v2.3.4
       with:
          submodules: true
     - name: Check Cargo availability
       run: cargo --version
-    - name: Test
+    - name: Build
       run:
-         cargo test
+         cargo build
+    - name: Build with instrument feature
+      run:
+         cargo clean && RUSTFLAGS="-Z instrument-mcount" cargo build
+    - name: Compile, but don't run benchmarks
+      run:
+         cargo bench --no-run
+
+  kernel-tests:
+    name: Rusty-Hermit Kernel based integration tests
+    runs-on: [self-hosted]
+
+    steps:
+    - uses: hecrj/setup-rust-action@v1
+      with:
+         rust-version: nightly
+         components: 'rustfmt, clippy'
+         targets: 'x86_64-unknown-linux-gnu'
+    - uses: actions/checkout@v2.3.4
+      with:
+         submodules: true
+    - name: Check Cargo availability
+      run: cargo --version
+    - name: Integration Tests
+      run: cargo test --test '*'
+    - name: Generate integration test coverage
+      run: |
+        ./generate_test_coverage.sh --print-coverage
+    - name: Generate unit test coverage
+      run: |
+        #./generate_test_coverage.sh --print-coverage
+        bash <(curl -s https://codecov.io/bash) -f
+    - uses: codecov/codecov-action@v1.5.2
+      with:
+        files: ./coveralls.json

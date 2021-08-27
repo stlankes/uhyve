@@ -1,4 +1,6 @@
 /// Describe Hardware Break/Watchpoints in a format easily convertible into raw addrs and bits in Dr7 register
+use log::error;
+
 #[derive(Copy, Clone)]
 pub struct HWBreakpoint {
 	pub addr: u64,
@@ -81,6 +83,7 @@ impl HWBreakpoints {
 	}
 }
 
+#[allow(clippy::unusual_byte_groupings)]
 #[test]
 fn test_hwbreakpoints_dr7() {
 	let br = HWBreakpoints([

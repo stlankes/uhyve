@@ -1,8 +1,9 @@
-use gdb_parser::{self, handle_packet, Handler, Response, StopReason, VCont};
 use gdb_protocol::{
 	io::GdbServer,
 	packet::{CheckedPacket, Kind},
 };
+
+use crate::gdb_parser::{self, handle_packet, Handler, Response, StopReason, VCont};
 use std::cell::RefCell;
 use std::io::BufReader;
 use std::net::TcpStream;
@@ -25,11 +26,9 @@ use std::net::TcpStream;
 ///
 /// - To be Host-OS/Arch flexible, both Handler and State are defined in eg `linux/gdb.rs`
 ///
+use crate::os::gdb;
 
-#[cfg(target_os = "linux")]
-use linux::gdb;
-#[cfg(target_os = "macos")]
-use macos::gdb;
+use log::{debug, info};
 
 pub type State = gdb::State;
 
@@ -52,13 +51,13 @@ impl DebugManager {
 		})
 	}
 
-	/// main event-loop. Called from vcpu trap, loops and executes commmands until debugger tells us to continue.
+	/// main event-loop. Called from vcpu trap, loops and executes commands until debugger tells us to continue.
 	/// Do not borrow state in this func, since handler is expected to borrow/mutate it.
 	pub fn handle_commands<H>(
 		&self,
 		handler: &mut H,
 		signal: Option<StopReason>,
-	) -> std::result::Result<VCont, gdb_protocol::Error>
+	) -> Result<VCont, gdb_protocol::Error>
 	where
 		H: Handler,
 	{
