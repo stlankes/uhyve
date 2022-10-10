@@ -20,7 +20,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v3.1.0
     - name: Install toolchain from rust-toolchain.toml
       run: rustup show
     - name: Test
@@ -35,7 +35,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v3.1.0
     - name: Install toolchain from rust-toolchain.toml
       run: rustup show
     - name: Build
@@ -51,7 +51,7 @@ jobs:
       run: |
         sudo apt-get update
         sudo apt-get install -y --no-install-recommends gdb
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v3.1.0
       with:
         lfs: true
     - run: git lfs checkout benches_data/hello_world
@@ -68,7 +68,7 @@ jobs:
       run: |
         sudo apt-get update
         sudo apt-get install -y --no-install-recommends gdb
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v3.1.0
       with:
         lfs: true
     - run: git lfs checkout benches_data/hello_world
