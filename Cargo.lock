@@ -476,19 +476,25 @@ name = "kvm-bindings"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a78c049190826fff959994b7c1d8a2930d0a348f1b8f3aa4f9bb34cd5d7f2952"
+
+[[package]]
+name = "kvm-bindings"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "efe70e65a5b092161d17f5005b66e5eefe7a94a70c332e755036fc4af78c4e79"
 dependencies = [
- "vmm-sys-util",
+ "vmm-sys-util 0.11.1",
 ]
 
 [[package]]
 name = "kvm-ioctls"
-version = "0.10.0"
+version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "48dc14f9047df1873cf6942caccc7431d19c3d496ca7a0d162260c4cf0f64b76"
+checksum = "b8f8dc9c1896e5f144ec5d07169bc29f39a047686d29585a91f30489abfaeb6b"
 dependencies = [
- "kvm-bindings",
+ "kvm-bindings 0.6.0",
  "libc",
- "vmm-sys-util",
+ "vmm-sys-util 0.11.1",
 ]
 
 [[package]]
@@ -1042,7 +1048,7 @@ dependencies = [
  "gdbstub",
  "gdbstub_arch",
  "goblin",
- "kvm-bindings",
+ "kvm-bindings 0.5.0",
  "kvm-ioctls",
  "lazy_static",
  "libc",
@@ -1056,7 +1062,7 @@ dependencies = [
  "thiserror",
  "tun-tap",
  "virtio-bindings",
- "vmm-sys-util",
+ "vmm-sys-util 0.9.0",
  "x86_64",
  "xhypervisor",
 ]
@@ -1096,6 +1102,16 @@ name = "vmm-sys-util"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "733537bded03aaa93543f785ae997727b30d1d9f4a03b7861d23290474242e11"
+dependencies = [
+ "bitflags",
+ "libc",
+]
+
+[[package]]
+name = "vmm-sys-util"
+version = "0.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dd64fe09d8e880e600c324e7d664760a17f56e9672b7495a86381b49e4f72f46"
 dependencies = [
  "bitflags",
  "libc",
